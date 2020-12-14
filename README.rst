@@ -73,14 +73,18 @@ Dependencies and Installation
 
 **imagenode** has been tested with:
 
-- Python 3.5 and 3.6
-- OpenCV 3.3
-- Raspbian Stretch and Raspbian Jessie
-- PyZMQ 16.0
-- RPi.GPIO 0.6.5  (imported only if using GPIO pins)
-- picamera 1.13   (imported only if using PiCamera)
-- imagezmq 0.0.2
-- imutils 0.4.3 (used get to images from PiCamera)
+- Python 3.6 and newer
+- OpenCV 3.3 and 4.0 and newer
+- Raspbian Stretch, Raspbian Jessie and Raspbian Buster
+- PyZMQ 16.0 and newer
+- RPi.GPIO 0.6 and newer (imported only if using GPIO pins)
+- picamera 1.13 (imported only if using PiCamera)
+- imagezmq 1.1.1 and newer
+- imutils 0.4.3 and newer (used get to images from PiCamera)
+- psutil 5.7.2 and newer
+- PyYAML 5.3 and newer
+- w1thermsensor 1.3 and newer (if using DS18S20 temperature sensor)
+- adafruit-circuitpython-dht 3.4.2 and newer (if using DHT11 or DHT22 sensor)
 
 **imagenode** captures images and uses **imagezmq** to transfer the images.
 It is best to install and test **imagezmq** before installing **imagenode**.
@@ -120,35 +124,36 @@ called py3cv3.
 **imagenode** requires **imagezmq** be installed and working. Before running any
 tests with **imagenode**, be sure you have successfully installed **imagezmq**
 and run all of its tests. The **imagezmq** tests must run successfully on every
-computer you will be using **imagenode** on. You should then be able to run the
-tests below.
+computer you will be using **imagenode** on. You can use pip to install
+**imagezmq**.
 
 Directory Structure for running the tests
 -----------------------------------------
-Neither **imagenode** or **imagezmq** are far enough along in their development
-to be pip installable. So they should both be git-cloned to any computer that
-they will be running on. I have done all testing at the user home
+**imagenode** is not far enough along in development
+to be pip installable. So it should both be git-cloned to any computer that
+it will be running on. I have done all testing at the user home
 directory of every computer. Here is a simplified directory layout::
 
   ~ # user home directory
   +--- imagenode.yaml  # copied from one of the imagenode yaml files & edited
   |
   +--- imagenode    # the git-cloned directory for imagenode
-  |    +--- sub directories include docs, imagenode, tests, yaml
-  |
-  +--- imagezmq     # the git-cloned directory for imagezmq
-       +--- sub directories include docs, imagezmq, tests
+       +--- sub directories include docs, imagenode, tests, yaml
 
 This directory arrangement, including docs, imagenode code, tests, etc. is a
 common development directory arrangement on GitHub. Using git clone from your
 user home directory (either on a Mac, a RPi or other Linux computer) will
-put both the **imagenode** and **imagezmq** directories in the right place
-for testing.
+put the **imagenode** directories in the right place for testing. Each test
+described below requires you to copy the appropriate ``testN.yaml`` file to
+``imagenode.yaml`` in the user home directory as shown in the above directory
+diagram. The ``receive_test.py`` program acts as the image hub test receiver for
+each imagenode test. It must be started and running before running
+``imagenode.py.``
 
 Test 1: Running **imagenode** and **imagezmq** together on a Mac
 -----------------------------------------------------------------
 **The first test** runs both the sending program **imagenode** and the receiving
-program **imagezmq** timing_receive_jpg_buf.py (acting as a test hub) on
+program ``receive_test.py`` (acting as a test hub) on
 a Mac (or linux computer) with a webcam. It tests that the **imagenode** software
 is installed correctly and that the ``imagenode.yaml`` file has been copied and
 edited in a way that works. It uses the webcam on the Mac for testing. It uses a
@@ -156,7 +161,7 @@ edited in a way that works. It uses the webcam on the Mac for testing. It uses a
 
 Test 2: Sending a light detector stream of images from RPi PiCamera to a Mac
 ----------------------------------------------------------------------------
-**The second test** runs **imagenode** on a Raspberry Pi, using **imagezmq**
+**The second test** runs **imagenode** on a Raspberry Pi, using ``receive_test.py``
 (acting as a test hub) on a Mac (or Linux computer). It tests that the
 **imagenode** software is installed correctly on the RPi and that
 the ``imagenode.yaml`` file has been copied and edited in a way that works.
@@ -166,14 +171,14 @@ detector applied to a specified ROI.
 
 Test 3: Sending a motion detector stream of images from RPi PiCamera to a Mac
 -----------------------------------------------------------------------------
-**The third test** runs **imagenode** on a Raspberry Pi, using **imagezmq**
+**The third test** runs **imagenode** on a Raspberry Pi, using ``receive_test.py``
 (acting as a test hub) on a Mac (or Linux computer). It is very similar to Test
 2, except that it uses a "moving" versus "still" motion detector applied to a
 specified ROI.
 
 Test 4: Sending temperature readings from RPi temperature sensor to a Mac
 -------------------------------------------------------------------------
-**The fourth test** runs **imagenode** on a Raspberry Pi, using **imagezmq**
+**The fourth test** runs **imagenode** on a Raspberry Pi, using ``receive_test.py``
 (acting as a test hub) on a Mac (or Linux computer). It allows testing of the
 temperature sensor capabilities of **imagenode**. It requires setting up a
 DS18B20 temperature sensor and connecting it appropriately to RPi GPIO pin 4.
@@ -202,9 +207,10 @@ of the imagenode.py program file.
 
 Additional Documentation
 ========================
+- `More details on running the tests <docs/testing.rst>`_.
 - `How imagenode works <docs/imagenode-details.rst>`_.
 - `How imagenode is used in a larger project <docs/imagenode-uses.rst>`_.
-- `Release and Version History <docs/release-history.rst>`_.
+- `Version History and Changelog <HISTORY.md>`_.
 - `Research and Development Roadmap <docs/research-roadmap.rst>`_.
 - `The imagezmq classes that allow transfer of images <https://github.com/jeffbass/imagezmq>`_.
 - `The imagehub software that saves events and images <https://github.com/jeffbass/imagehub>`_.
@@ -215,8 +221,29 @@ Contributing
 ============
 **imagenode** is in early development and testing. I welcome open issues and
 pull requests, but because the programs are still rapidly evolving, it is best
-to open an issue with some discussion before submitting any pull requests or
-code changes.
+to open an issue for some discussion before submitting pull requests. We can
+exchange ideas about your potential pull request how to best test your code.
+
+Contributors
+============
+Thanks for all contributions big and small. Some significant ones:
+
++--------------------------+-----------------+----------------------------------------------+
+| **Contribution**         | **Name**        | **GitHub**                                   |
++--------------------------+-----------------+----------------------------------------------+
+| Initial code & docs      | Jeff Bass       | `@jeffbass <https://github.com/jeffbass>`_   |
++--------------------------+-----------------+----------------------------------------------+
+| Added code and           |                 |                                              |
+| documentation for        |                 |                                              |
+| PiCamera settings        | Stephen Kirby   | `@sbkirby <https://github.com/sbkirby>`_     |
++--------------------------+-----------------+----------------------------------------------+
+| Added DHT11 & DHT22      |                 |                                              |
+| sensor capability        | Stephen Kirby   | `@sbkirby <https://github.com/sbkirby>`_     |
++--------------------------+-----------------+----------------------------------------------+
+| Added multiple detectors |                 |                                              |
+| per camera capability    | Stephen Kirby   | `@sbkirby <https://github.com/sbkirby>`_     |
++--------------------------+-----------------+----------------------------------------------+
+
 
 Acknowledgments
 ===============

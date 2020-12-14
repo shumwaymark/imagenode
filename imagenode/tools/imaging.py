@@ -18,6 +18,7 @@ import logging
 import itertools
 import threading
 from time import sleep
+from datetime import datetime
 from ast import literal_eval
 from collections import deque
 import numpy as np
@@ -28,8 +29,11 @@ from imutils.video import VideoStream
 import imagezmq
 from tools.utils import interval_timer
 from tools.nodehealth import HealthMonitor
+from tools.utils import versionCompare
+from pkg_resources import require
 from sentinelcam.utils import FPS
 from pyimagesearch.centroidtracker import CentroidTracker
+
 
 class ImageNode:
     """ Contains all the attributes and methods of this imagenode
@@ -49,14 +53,33 @@ class ImageNode:
 
     def __init__(self, settings):
         # set various node attributes; also check that numpy and OpenCV are OK
-        self.tiny_image = np.zeros((3,3), dtype="uint8")  # tiny blank image
+        self.tiny_image = np.zeros((3, 3), dtype="uint8")  # tiny blank image
         ret_code, jpg_buffer = cv2.imencode(
             ".jpg", self.tiny_image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        self.tiny_jpg = jpg_buffer # matching tiny blank jpeg
+        self.tiny_jpg = jpg_buffer  # matching tiny blank jpeg
         self.jpeg_quality = 95
 
+        # open ZMQ link to imagehub
+        # use either of the formats below to specifiy address of display computer
+        # sender = imagezmq.ImageSender(connect_to='tcp://jeff-macbook:5555')
+        # self.sender = imagezmq.ImageSender(connect_to='tcp://192.168.1.190:5555')
+        self.sender = imagezmq.ImageSender(connect_to=settings.hub_address)
+
+        self.send_frame = self.send_jpg_frame  # default send function is jpg
+        if settings.send_type == 'image':
+            self.send_frame = self.send_image_frame  # set send function to image
+        else:  # anything not spelled 'image' is set to jpg
+            self.send_frame = self.send_jpg_frame  # set send function to jpg
+
         # set up message queue to hold (text, image) messages to be sent to hub
-        self.send_q = deque(maxlen=settings.queuemax)
+        if settings.send_threading:  # use a threaded send_q sender instead
+            self.send_q = SendQueue(maxlen=settings.queuemax,
+                                    send_frame=self.send_frame,
+                                    process_hub_reply=self.process_hub_reply)
+            self.send_q.start()
+        else:
+            self.send_q = deque(maxlen=settings.queuemax)
+
         # start system health monitoring & get system type (RPi vs Mac etc)
         self.health = HealthMonitor(settings, self.send_q)
 
@@ -69,17 +92,9 @@ class ImageNode:
                 GPIO.setmode(GPIO.BCM)
                 GPIO.setwarnings(False)
             if settings.sensors:   # is there at least one sensor in yaml file
-                global W1ThermSensor  # for DS18B20 temperature sensor
-                from w1thermsensor import W1ThermSensor
                 self.setup_sensors(settings)
             if settings.lights:   # is there at least one light in yaml file
                 self.setup_lights(settings)
-
-        self.send_frame = self.send_jpg_frame # default send function is jpg
-        if settings.send_type == 'image':
-            self.send_frame = self.send_image_frame # set send function to image
-        else: # anything not spelled 'image' is set to jpg
-            self.send_frame = self.send_jpg_frame # set send function to jpg
 
         # set up and start camera(s)
         self.camlist = []  # need an empty list if there are no cameras
@@ -127,10 +142,15 @@ class ImageNode:
                 detector.bottom_right = (bottom_right_x, bottom_right_y)
                 detector.roi_pixels = (detector.top_left, detector.bottom_right)
                 detector.roi_area = ((bottom_right_x - top_left_x)
-                                    * (bottom_right_y - top_left_y))
+                                     * (bottom_right_y - top_left_y))
                 if detector.detector_type == 'motion':
                     detector.min_area_pixels = (detector.roi_area
                                                 * detector.min_area) // 100
+                # location of timestamp based on image size
+                if detector.draw_time:
+                    time_x = detector.draw_time_org[0] * width // 100
+                    time_y = detector.draw_time_org[1] * height // 100
+                    detector.draw_time_org = (time_x, time_y)
 
         if settings.print_node:
             self.print_node_details(settings)
@@ -146,24 +166,56 @@ class ImageNode:
             print('    Resize_width setting:', cam.resize_width)
             print('    Resolution after resizing:', cam.res_resized)
             if cam.cam_type == 'PiCamera':
-                print ('    PiCamera exposure_mode:', cam.cam.camera.exposure_mode)
+                # check picamera version
+                try:
+                    picamversion = require('picamera')[0].version
+                except:
+                    picamversion = '0'
+                print('    PiCamera:')
+                # awb_mode: off, auto, sunlight, cloudy, shade, tungsten, fluorescent, incandescent, flash, horizon
+                print('        awb_mode:', cam.cam.camera.awb_mode, '(default = auto)')
+                print('        brightness:', cam.cam.camera.brightness, '(default = 50, integer between 0 and 100)')
+                print('        contrast:', cam.cam.camera.contrast, '(default = 0, integer between -100 and 100)')
+                # exposure_compensation: integer value between -25 and 25
+                print('        exposure_compensation:', cam.cam.camera.exposure_compensation, '(default = 0)')
+                # exposure_mode:  - off, auto, night, nightpreview, backlight, spotlight, sports, snow, beach, verylong,
+                #                   fixedfps, antishake, fireworks
+                print('        exposure_mode:', cam.cam.camera.exposure_mode, '(default = auto)')
+                print('        framerate:', cam.cam.camera.framerate, '(default = 30)')
+                print('        iso:', cam.cam.camera.iso, '(default = 0 for auto - 0,100,200,320,400,500,640,800)')
+                # meter_mode:  average, spot, backlit, matrix
+                print('        meter_mode:', cam.cam.camera.meter_mode, '(default = average)')
+                print('        saturation:', cam.cam.camera.saturation, '(default = 0, integer between -100 and 100)')
+                print('        sharpness:', cam.cam.camera.sharpness, '(default = 0, integer between -100 and 100)')
+                print('        shutter_speed:', cam.cam.camera.shutter_speed, '(microseconds - default = 0 for auto)')
+                if versionCompare('1.6', picamversion) != 1:
+                    print('        analog_gain:', float(cam.cam.camera.analog_gain), '(read-only)')
+                    # awb_gains: typical values for the gains are between 0.9 and 1.9 - when awb_mode = off
+                    print('        awb_gains:', cam.cam.camera.awb_gains)
+                    print('        digital_gain:', float(cam.cam.camera.digital_gain), '(read-only)')
+                    print('        exposure_speed:', cam.cam.camera.exposure_speed, '(microseconds - read-only)')
+                if versionCompare('1.13', picamversion) != 1:
+                    print('        revision:', cam.cam.camera.revision, '(ov5647 = V1, imx219 = V2, imx477 = HQ)')
+
             for detector in cam.detectors:
                 print('    Detector:', detector.detector_type)
                 print('      ROI:', detector.roi_pct, '(in percents)')
                 print('      ROI:', detector.roi_pixels, '(in pixels)')
                 print('      ROI area:', detector.roi_area, '(in pixels)')
+                print('      ROI name:', detector.roi_name)
                 print('      send_test_images:', detector.send_test_images)
                 print('      send_count:', detector.send_count)
                 if detector.detector_type == 'light':
-                    print('      threshhold:', detector.threshold)
+                    print('      threshold:', detector.threshold)
                     print('      min_frames:', detector.min_frames)
                 elif detector.detector_type == 'motion':
-                    print('      delta_threshhold:', detector.delta_threshold)
+                    print('      delta_threshold:', detector.delta_threshold)
                     print('      min_motion_frames:', detector.min_motion_frames)
                     print('      min_still_frames:', detector.min_still_frames)
                     print('      min_area:', detector.min_area, '(in percent)')
                     print('      min_area:', detector.min_area_pixels, '(in pixels)')
                     print('      blur_kernel_size:', detector.blur_kernel_size)
+                    print('      print_still_frames:', detector.print_still_frames)
         print()
 
     def setup_sensors(self, settings):
@@ -178,7 +230,7 @@ class ImageNode:
 
         for sensor in settings.sensors:  # for each sensor listed in yaml file
             s = Sensor(sensor, settings.sensors, settings, self.tiny_image,
-                        self.send_q)
+                       self.send_q)
             self.sensors.append(s)  # add it to the list of sensors
 
     def setup_lights(self, settings):
@@ -192,8 +244,8 @@ class ImageNode:
         """
 
         for light in settings.lights:  # for each light listed in yaml file
-            l = Light(light, settings.lights, settings)  # create a Light instance with settings
-            self.lights.append(l)  # add it to the list of lights
+            lst = Light(light, settings.lights, settings)  # create a Light instance with settings
+            self.lights.append(lst)  # add it to the list of lights
 
     def setup_cameras(self, settings):
         """ Create a list of cameras from the cameras section of the yaml file
@@ -215,9 +267,9 @@ class ImageNode:
         Function self.send_frame() is set to this function if jpg option chosen
         """
 
-        ret_code, jpg_buffer = cv2.imencode(
-            ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY),
-            self.jpeg_quality])
+        ret_code, jpg_buffer = cv2.imencode(".jpg", image,
+                                            [int(cv2.IMWRITE_JPEG_QUALITY),
+                                             self.jpeg_quality])
         hub_reply = self.sender.send_jpg(text, jpg_buffer)
         return hub_reply
 
@@ -269,10 +321,21 @@ class ImageNode:
 
         if detector.draw_roi:
             cv2.rectangle(image,
-                detector.top_left,
-                detector.bottom_right,
-                detector.draw_color,
-                detector.draw_line_width)
+                          detector.top_left,
+                          detector.bottom_right,
+                          detector.draw_color,
+                          detector.draw_line_width)
+        # For troubleshooting purposes - print time on images
+        if detector.draw_time:
+            display_time = datetime.now().isoformat(sep=' ', timespec='microseconds')
+            cv2.putText(image,
+                        display_time,
+                        detector.draw_time_org,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        detector.draw_time_fontScale,
+                        detector.draw_time_color,
+                        detector.draw_time_width,
+                        cv2.LINE_AA)
         # detect state (light, etc.) and put images and events into send_q
         detector.detect_state(camera, image, self.send_q)
 
@@ -294,7 +357,6 @@ class ImageNode:
         #
         sys.exit()
         return 'hub_reply'
-        pass
 
     def process_hub_reply(self, hub_reply):
         """ Process hub reply if it is other than "OK".
@@ -330,6 +392,78 @@ class ImageNode:
         if self.health.stall_p:
             self.health.stall_p.terminate()
             self.health.stall_p.join()
+        if settings.send_threading:
+            self.send_q.stop_sending()
+        self.sender.close()
+
+
+
+class SendQueue:
+    """ Implements a send_q replacement that uses threaded sends
+
+    The default send_q is a deque that is filled in a read_cameras forever loop
+    in the imagenode.py main() event loop. When the default send_q tests True
+    because it contains images to send, the send_frame loop empties the send_q.
+    It works, but has speed issues when sending occurs while motion detection is
+    actively occuring at the same time.
+
+    This class creates a drop-in replacement for send_q. This replacement
+    send_q will always return len(send_q) as 0 as if empty, so that the main()
+    event loop will loop forever in node.read_cameras() without ever sending
+    anything. This is implemented by providing _bool_ and __len__ methods to
+    prevent read_cameras from ever reaching the send_frame portion of the main
+    imagenode.py event loop.
+
+    This send_q replacement append() method will operate in read_cameras just as
+    the deque did, but has a send_messages_forever method in a separate
+    thread to send (message, image tuples) to empty the send_q. This
+    implementation of send_q allows the imagenode.py main program to remain
+    unchanged when send_threading is not set to True in the yaml settings.
+
+    Parameters:
+        maxlen (int): maximum length of send_q deque
+        send_frame (func): the ImageNode method that sends frames
+        process_hub_reply (func): the ImageNode method that processes hub replies
+
+    """
+    def __init__(self, maxlen=500, send_frame=None, process_hub_reply=None):
+        self.send_q = deque(maxlen=maxlen)
+        self.send_frame = send_frame
+        self.process_hub_reply = process_hub_reply
+        self.keep_sending = True
+
+    def __bool__(self):
+        return False  # so that the read loop keeps reading forever
+
+    def __len__(self):
+        return 0  # so that the main() send loop is never entered
+
+    def append(self, text_and_image):
+        self.send_q.append(text_and_image)
+
+    def send_messages_forever(self):
+        # this will run in a separate thread
+        # the "sleep()" calls allow main thread more time for image capture
+        while self.keep_sending:
+            if len(self.send_q) > 0:  # send until send_q is empty
+                text, image = self.send_q.popleft()
+                sleep(0.0000001)  # sleep before sending
+                hub_reply = self.send_frame(text, image)
+                self.process_hub_reply(hub_reply)
+            else:
+                sleep(0.0000001)  # sleep before checking send_q again
+
+    def start(self):
+        # start the thread to read frames from the video stream
+        t = threading.Thread(target=self.send_messages_forever)
+        print('Starting threading')
+        t.daemon = True
+        t.start()
+
+    def stop_sending(self):
+        self.keep_sending = False
+        sleep(0.0000001)  # sleep to allow ZMQ to clear buffer
+
 
 class Sensor:
     """ Methods and attributes of a sensor, such as a temperature sensor
@@ -342,11 +476,6 @@ class Sensor:
         sensors (dict): dictionary of all the sensors in the YAML file
         settings (Settings object): settings object created from YAML file
 
-    TODO Make imports of GPIO and W1ThermSensor conditional on actual need for
-    them. For now, they are imported every time whether needed or not.
-
-    TODO This is coded for a single DS18B20 temperature sensor. Add
-    code for DHT22 sensors and for multiple DS18B20 sensors.
     """
 
     def __init__(self, sensor, sensors, settings, tiny_image, send_q):
@@ -367,6 +496,10 @@ class Sensor:
             self.type = sensors[sensor]['type']
         else:
             self.type = 'Unknown'
+        if 'unit' in sensors[sensor]:
+            self.unit = sensors[sensor]['unit'].upper()
+        else:
+            self.unit = 'F'
         if 'read_interval_minutes' in sensors[sensor]:
             self.interval = sensors[sensor]['read_interval_minutes']
         else:
@@ -375,37 +508,85 @@ class Sensor:
             self.min_difference = sensors[sensor]['min_difference']
         else:
             self.min_difference = 1  # minimum difference to count as reportable
-        self.interval *= 60.0 # convert often to check sensor to seconds
+        self.interval *= 60.0  # convert often to check sensor to seconds
 
         # self.event_text is the text message for this sensor that is
         #   sent when the sensor value changes
         # example: Barn|Temperaure|85 F
+        # example: Barn|Humidity|42 %
         # example: Garage|Temperature|71 F
         # example: Compost|Moisture|95 %
         # self.event_text will have self.current_reading appended when events are sent
-        self.event_text = '|'.join([settings.nodename, self.name]).strip()
+        # self.event_text = '|'.join([settings.nodename, self.name]).strip()
+        self.event_text = settings.nodename
+        # Initialize last_reading and temp_sensor variables
+        self.last_reading_temp = -999  # will ensure first temp reading is a change
+        self.last_reading_humidity = -999  # will ensure first humidity reading is a change
+        self.temp_sensor = None
 
-        # TODO add other sensor types as testing is completed for each sensor type
+        # Sensor types
         if self.type == 'DS18B20':
+            # note that DS18B20 requires GPIO pin 4 (unless kernel is modified)
+            global W1ThermSensor  # for DS18B20 temperature sensor
+            from w1thermsensor import W1ThermSensor
             self.temp_sensor = W1ThermSensor()
-            self.last_reading = -999  # will ensure first reading is a change
-            self.check_temperature() # check one time, then start interval_timer
+
+        if (self.type == 'DHT11') or (self.type == 'DHT22'):
+            global adafruit_dht  # for DHT11 & DHT22 temperature sensor
+            import adafruit_dht
+            if self.type == 'DHT11':
+                self.temp_sensor = adafruit_dht.DHT11(self.gpio)
+            if self.type == 'DHT22':
+                self.temp_sensor = adafruit_dht.DHT22(self.gpio)
+
+        if self.temp_sensor is not None:
+            self.check_temperature()  # check one time, then start interval_timer
             threading.Thread(daemon=True,
-                target=lambda: interval_timer(
-                    self.interval, self.check_temperature)).start()
+                             target=lambda: interval_timer(self.interval, self.check_temperature)).start()
 
     def check_temperature(self):
-        """ adds temperature value from a sensor to senq_q message queue
+        """ adds temperature & humidity (if available) value from a sensor to senq_q message queue
         """
-        temperature = int(self.temp_sensor.get_temperature(W1ThermSensor.DEGREES_F))
-        if abs(temperature - self.last_reading) >= self.min_difference:
+        if self.type == 'DS18B20':
+            if self.unit == 'C':
+                temperature = int(self.temp_sensor.get_temperature(W1ThermSensor.DEGREES_C))
+            else:
+                temperature = int(self.temp_sensor.get_temperature(W1ThermSensor.DEGREES_F))
+            humidity = -999
+        if (self.type == 'DHT11') or (self.type == 'DHT22'):
+            for i in range(5):  # try for valid readings 5 times; break if valid
+                try:
+                    if self.unit == 'C':
+                        temperature = self.temp_sensor.temperature
+                    else:
+                        temperature = self.temp_sensor.temperature * (9 / 5) + 32
+                    temperature = float(format(temperature, '.1f'))
+                    humidity = self.temp_sensor.humidity
+                    humidity = float(format(humidity, '.1f'))
+                    break  # break out of for loop if got valid readings
+                except RuntimeError:
+                    sleep(3)  # wait 3 seconds and try again
+                    pass  # this will retry up to 5 times before exiting the for loop
+
+        if abs(temperature - self.last_reading_temp) >= self.min_difference:
             # temperature has changed from last reported temperature, therefore
             # send an event message reporting temperature by appending to send_q
-            temp_text = str(temperature) + " F"
-            text = '|'.join([self.event_text, temp_text])
+            temp_text = str(temperature) + " " + self.unit
+            text = '|'.join([self.event_text, 'Temp', temp_text])
             text_and_image = (text, self.tiny_image)
             self.send_q.append(text_and_image)
-            self.last_reading = temperature
+            self.last_reading_temp = temperature
+        if abs(humidity - self.last_reading_humidity) >= self.min_difference:
+            # humidity has changed from last reported humidity, therefore
+            # send an event message reporting humidity by appending to send_q
+            humidity_text = str(humidity) + " %"
+            # Spelling of humidity all lower case is intentional to avoid
+            # first letter test of "Heartbeat" in imagehub
+            text = '|'.join([self.event_text, 'humidity', humidity_text])
+            text_and_image = (text, self.tiny_image)
+            self.send_q.append(text_and_image)
+            self.last_reading_humidity = humidity
+
 
 class Light:
     """ Methods and attributes of a light controlled by an RPi GPIO pin
@@ -452,6 +633,44 @@ class Light:
         """
         GPIO.output(self.gpio, False)  # turn off light
 
+
+
+class PiCameraUnthreadedStream():
+    """ Rreads the PiCamera without threading.
+
+    The PiVideoStream class within imutils.VideoStream provides a threaded way
+    to read the PiCamera images. This class provides a way to read the PiCamera
+    without threading, primarily intended for testing. For compatibility, the
+    method names are the same as imutils.VideoStream.
+    """
+    def __init__(self, resolution=(320, 240), framerate=32, **kwargs):
+        from picamera.array import PiRGBArray
+        from picamera import PiCamera
+        self.camera = PiCamera()
+        self.camera.resolution = resolution
+        self.camera.framerate = framerate
+        self.rawCapture = PiRGBArray(self.camera, size=resolution)
+        self.stream = self.camera.capture_continuous(self.rawCapture,
+                                                     format="bgr",
+                                                     use_video_port=True)
+        self.frame = None
+
+    def read(self):
+        f = next(self.stream)  # or f = self.stream.read()?
+        self.frame = f.array
+        self.rawCapture.truncate(0)
+        return self.frame
+
+    def stop(self):
+        self.close()
+
+    def close(self):
+        self.stream.close()
+        self.rawCapture.close()
+        self.camera.close()
+
+
+
 class Camera:
     """ Methods and attributes of a camera
 
@@ -470,6 +689,16 @@ class Camera:
 
         self.cam = None
         self.jpeg_quality = 95  # 0 to 100, higher is better quality, 95 is cv2 default
+        # check picamera version
+        try:
+            picamversion = require('picamera')[0].version
+        except:
+            picamversion = '0'
+
+        if 'threaded_read' in cameras[camera]:  # threaded on non-threaded camera reading
+            self.threaded_read = cameras[camera]['threaded_read']
+        else:
+            self.threaded_read = True
         if 'resolution' in cameras[camera]:
             self.resolution = literal_eval(cameras[camera]['resolution'])
         else:
@@ -500,29 +729,86 @@ class Camera:
             self.exposure_mode = cameras[camera]['exposure_mode']
         else:
             self.exposure_mode = None
+        if 'iso' in cameras[camera]:
+            self.iso = cameras[camera]['iso']
+        else:
+            self.iso = 0  # default value
+        if 'shutter_speed' in cameras[camera]:
+            self.shutter_speed = cameras[camera]['shutter_speed']
+        else:
+            self.shutter_speed = 0  # default value
+        if 'sharpness' in cameras[camera]:
+            self.sharpness = cameras[camera]['sharpness']
+        else:
+            self.sharpness = 0  # default value
+        if 'contrast' in cameras[camera]:
+            self.contrast = cameras[camera]['contrast']
+        else:
+            self.contrast = 0  # default value
+        if 'brightness' in cameras[camera]:
+            self.brightness = cameras[camera]['brightness']
+        else:
+            self.brightness = 50  # default value
+        if 'exposure_compensation' in cameras[camera]:
+            self.exposure_compensation = cameras[camera]['exposure_compensation']
+        else:
+            self.exposure_compensation = 0  # 0 default value, integer value between -25 and 25
+        if 'awb_mode' in cameras[camera]:
+            self.awb_mode = cameras[camera]['awb_mode']
+        else:
+            self.awb_mode = 'auto'  # default value
         if 'video' in cameras[camera]:
             self.video = cameras[camera]['video']
             self.velocity = FPS()
         else:
             self.video = False
+
         self.detectors = []
         if 'detectors' in cameras[camera]:  # is there at least one detector
             self.setup_detectors(cameras[camera]['detectors'],
-            settings.nodename, self.viewname)
-
+                                 settings.nodename,
+                                 self.viewname)
         if camera[0].lower() == 'p':  # this is a picam
             # start PiCamera and warm up; inherits methods from VideoStream
-            self.cam = VideoStream(usePiCamera=True,
-                resolution=self.resolution,
-                framerate=self.framerate).start()
+            # unless threaded_read is False; then uses class
+            # PiCameraUnthreadedStream to read the PiCamera in an unthreaded way
+            if self.threaded_read:
+                self.cam = VideoStream(usePiCamera=True,
+                                       resolution=self.resolution,
+                                       framerate=self.framerate).start()
+            else:
+                self.cam = PiCameraUnthreadedStream(resolution=self.resolution,
+                                                    framerate=self.framerate)
+
             # if an exposure mode has been set in yaml, set it
             if self.exposure_mode:
                 self.cam.camera.exposure_mode = self.exposure_mode
+            # if an iso has been set in yaml, set it
+            if self.iso:
+                self.cam.camera.iso = self.iso
+            # if an iso has been set in yaml, set it
+            if self.shutter_speed:
+                self.cam.camera.shutter_speed = self.shutter_speed
+            # if an sharpness has been set in yaml, set it
+            if self.sharpness:
+                self.cam.camera.sharpness = self.sharpness
+            # if an contrast has been set in yaml, set it
+            if self.contrast:
+                self.cam.camera.contrast = self.contrast
+            # if an brightness has been set in yaml, set it
+            if self.brightness:
+                self.cam.camera.brightness = self.brightness
+            # if an exposure_compensation has been set in yaml, set it
+            if self.exposure_compensation:
+                self.cam.camera.exposure_compensation = self.exposure_compensation
+            # if an awb_mode has been set in yaml, set it
+            if self.awb_mode:
+                self.cam.camera.awb_mode = self.awb_mode
             self.cam_type = 'PiCamera'
         else:  # this is a webcam (not a picam)
             self.cam = VideoStream(src=0).start()
             self.cam_type = 'webcam'
-        sleep(2.0)  # allow camera sensor to warm up
+        sleep(3.0)  # allow camera sensor to warm up
 
         # self.text is the text label for images from this camera.
         # Each image that is sent is sent with a text label so the hub can
@@ -546,9 +832,16 @@ class Camera:
             viewnane (str): viewname to identify event messages and images sent
         """
 
-        for detector in detectors:  # for each camera listed in yaml file
-            det = Detector(detector, detectors, nodename, viewname)  # create a Detector instance
-            self.detectors.append(det)  # add to list of detectors for this camera
+        if isinstance(detectors, list):
+            for lst in detectors:
+                for detector in lst:
+                    det = Detector(detector, lst, nodename, viewname)  # create a Detector instance
+                    self.detectors.append(det)  # add to list of detectors for this camera
+        else:
+            for detector in detectors:  # for each camera listed in yaml file
+                det = Detector(detector, detectors, nodename, viewname)  # create a Detector instance
+                self.detectors.append(det)  # add to list of detectors for this camera
+
 
 class Detector:
     """ Methods and attributes of a detector for motion, light, etc.
@@ -582,7 +875,7 @@ class Detector:
             else:
                 self.min_frames = 5  # 5 is default
             # need to remember min_frames of state history to calculate state
-            self.state_history_q  = deque(maxlen=self.min_frames)
+            self.state_history_q = deque(maxlen=self.min_frames)
 
         elif detector == 'motion':
             self.detect_state = self.detect_motion
@@ -596,20 +889,24 @@ class Detector:
             if 'min_area' in detectors[detector]:
                 self.min_area = detectors[detector]['min_area']
             else:
-                self.min_area = 3 # 3 is default percent of ROI
+                self.min_area = 3  # 3 is default percent of ROI
             if 'min_motion_frames' in detectors[detector]:
                 self.min_motion_frames = detectors[detector]['min_motion_frames']
             else:
-                self.min_motion_frames = 3 # 3 is default
+                self.min_motion_frames = 3  # 3 is default
             if 'min_still_frames' in detectors[detector]:
                 self.min_still_frames = detectors[detector]['min_still_frames']
             else:
-                self.min_still_frames = 3 # 3 is default
+                self.min_still_frames = 3  # 3 is default
             self.min_frames = max(self.min_motion_frames, self.min_still_frames)
             if 'blur_kernel_size' in detectors[detector]:
                 self.blur_kernel_size = detectors[detector]['blur_kernel_size']
             else:
-                self.blur_kernel_size = 15 # 15 is default blur_kernel_size
+                self.blur_kernel_size = 15  # 15 is default blur_kernel_size
+            if 'print_still_frames' in detectors[detector]:
+                self.print_still_frames = detectors[detector]['print_still_frames']
+            else:
+                self.print_still_frames = True  # True is default print_still_frames
 
         elif detector == 'tracker':
             self.detect_state = self.object_tracker
@@ -623,13 +920,38 @@ class Detector:
         if 'ROI' in detectors[detector]:
             self.roi_pct = literal_eval(detectors[detector]['ROI'])
         else:
-            self.roi_pct = ((0,0),(100,100))
+            self.roi_pct = ((0, 0), (100, 100))
         if 'draw_roi' in detectors[detector]:
             self.draw_roi = literal_eval(detectors[detector]['draw_roi'])
             self.draw_color = self.draw_roi[0]
             self.draw_line_width = self.draw_roi[1]
         else:
             self.draw_roi = None
+        # name of the ROI detector section
+        if 'roi_name' in detectors[detector]:
+            self.roi_name = detectors[detector]['roi_name']
+        else:
+            self.roi_name = ''
+        # include ROI name in log events
+        if 'log_roi_name' in detectors[detector]:
+            self.log_roi_name = detectors[detector]['log_roi_name']
+        else:
+            self.log_roi_name = False
+        # draw timestamp on image
+        if 'draw_time' in detectors[detector]:
+            self.draw_time = literal_eval(detectors[detector]['draw_time'])
+            self.draw_time_color = self.draw_time[0]
+            self.draw_time_width = self.draw_time[1]
+            if 'draw_time_org' in detectors[detector]:
+                self.draw_time_org = literal_eval(detectors[detector]['draw_time_org'])
+            else:
+                self.draw_time_org = (0, 0)
+            if 'draw_time_fontScale' in detectors[detector]:
+                self.draw_time_fontScale = detectors[detector]['draw_time_fontScale']
+            else:
+                self.draw_time_fontScale = 1
+        else:
+            self.draw_time = None
         send_frames = 'None Set'
         self.frame_count = 0
         # send_frames option can be 'continuous', 'detected event', 'none'
@@ -669,10 +991,10 @@ class Detector:
         self.current_state = 'unknown'
         self.last_state = 'unknown'
 
-        self.msg_image = np.zeros((2,2), dtype="uint8")  # blank image tiny
+        self.msg_image = np.zeros((2, 2), dtype="uint8")  # blank image tiny
         if self.send_test_images:
             # set the blank image wide enough to hold message of send_test_images
-            self.msg_image = np.zeros((5,320), dtype="uint8")  # blank image wide
+            self.msg_image = np.zeros((5, 320), dtype="uint8")  # blank image wide
 
     def detect_state(self, camera, image, send_q):
         """ Placeholder function will be set to specific detection function
@@ -724,7 +1046,7 @@ class Detector:
             images = []
             images.append(('ROI', ROI,))
             images.append(('Grayscale', gray,))
-            state_values =[]
+            state_values = []
             state_values.append(('State', state,))
             state_values.append(('Mean Pixel Value', str(gray_mean),))
             self.send_test_data(images, state_values, send_q)
@@ -746,6 +1068,8 @@ class Detector:
         # state has changed from last reported state, therefore
         # send event message, reporting current_state, by appending it to send_q
         text = '|'.join([self.event_text, self.current_state])
+        if self.log_roi_name:
+            text = '|'.join([text, self.roi_name])
         text_and_image = (text, self.msg_image)
         send_q.append(text_and_image)
 
@@ -755,7 +1079,7 @@ class Detector:
         #   by appending them to send_q
         if self.frame_count > 0:  # then need to send images of this event
             send_count = min(len(camera.cam_q), self.send_count)
-            for i in range(-send_count,-1):
+            for i in range(-send_count, -1):
                 text_and_image = (camera.text, camera.cam_q[i])
                 send_q.append(text_and_image)
 
@@ -784,6 +1108,10 @@ class Detector:
         Adrian Rosebrock on PyImageSearch.com. See README.rst for details.
         """
 
+        #####
+        # Branch to fix duplicate frames; see GitHub issues #15 (&#12)
+        #####
+
         # if we are sending images continuously, append current image to send_q
         if self.frame_count == -1:  # -1 code ==> send all frames continuously
             text_and_image = (camera.text, image)
@@ -795,8 +1123,8 @@ class Detector:
         ROI = image[y1:y2, x1:x2]
         gray = cv2.cvtColor(ROI, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray,
-                        (self.blur_kernel_size, self.blur_kernel_size), 0)
-
+                                (self.blur_kernel_size, self.blur_kernel_size),
+                                0)
         # If no history yet, save the first image as the  average image
         if self.total_frames < 1:
             self.average = gray.copy().astype('float')
@@ -805,16 +1133,17 @@ class Detector:
             cv2.accumulateWeighted(gray, self.average, 0.5)
         # frame delta is the absolute difference between gray and self.average
         frameDelta = cv2.absdiff(gray, cv2.convertScaleAbs(self.average))
-    	# threshold the frame delta image and dilate the thresholded image
+        # threshold the frame delta image and dilate the thresholded image
         thresholded = cv2.threshold(frameDelta, self.delta_threshold,
-                                    255,cv2.THRESH_BINARY)[1]
+                                    255, cv2.THRESH_BINARY)[1]
         thresholded = cv2.dilate(thresholded, None, iterations=2)
         # find contours in thresholded image
-        #(_, contours, __) = cv2.findContours(thresholded.copy(),
-        #                    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        (contours, _) = cv2.findContours(thresholded.copy(),
-                        cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
+        # OpenCV version 3.x returns a 3 value tuple
+        # OpenCV version 4.x returns a 2 value tuple
+        contours_tuple = cv2.findContours(thresholded.copy(),
+                                          cv2.RETR_EXTERNAL,
+                                          cv2.CHAIN_APPROX_SIMPLE)
+        contours = contours_tuple[-2]  # captures contours value correctly for both versions of OpenCV
         state = 'still'
         area = 0
         for contour in contours:
@@ -834,7 +1163,7 @@ class Detector:
             images.append(('Grayscale', gray,))
             images.append(('frameDelta', frameDelta,))
             images.append(('thresholded', thresholded,))
-            state_values =[]
+            state_values = []
             state_values.append(('State', self.current_state,))
             state_values.append(('N Contours', str(len(contours)),))
             state_values.append(('Area', str(area),))
@@ -862,6 +1191,8 @@ class Detector:
         # state has changed from last reported state, so...
         # send event message reporting current_state by appending it to send_q
         text = '|'.join([self.event_text, self.current_state])
+        if self.log_roi_name:
+            text = '|'.join([text, self.roi_name])
         text_and_image = (text, self.msg_image)
         send_q.append(text_and_image)
 
@@ -871,7 +1202,9 @@ class Detector:
         #   by appending them to send_q
         if self.frame_count > 0:  # then need to send images of this event
             send_count = min(len(camera.cam_q), self.send_count)
-            for i in range(-send_count,-1):
+            if (self.current_state == 'still') and (self.print_still_frames is False):
+                send_count = 0
+            for i in range(-send_count, -1):
                 text_and_image = (camera.text, camera.cam_q[i])
                 send_q.append(text_and_image)
 
@@ -897,9 +1230,9 @@ class Detector:
         font = cv2.FONT_HERSHEY_SIMPLEX
         for text_and_value in state_values:
             text, value = text_and_value
-            state_image = np.zeros((50,200), dtype="uint8")  # blank image
-            cv2.putText(state_image,value,(10,35), font,
-                        1,(255,255,255),2,cv2.LINE_AA)
+            state_image = np.zeros((50, 200), dtype="uint8")  # blank image
+            cv2.putText(state_image, value, (10, 35), font,
+                        1, (255, 255, 255), 2, cv2.LINE_AA)
             text_and_image = (text, state_image)
             send_q.append(text_and_image)
 
@@ -999,7 +1332,7 @@ class Settings:
 
     def __init__(self):
         userdir = os.path.expanduser("~")
-        with open(os.path.join(userdir,"imagenode.yaml")) as f:
+        with open(os.path.join(userdir, "imagenode.yaml")) as f:
             self.config = yaml.safe_load(f)
         self.print_node = False
         if 'node' in self.config:
@@ -1040,6 +1373,10 @@ class Settings:
             self.stall_watcher = self.config['node']['stall_watcher']
         else:
             self.stall_watcher = False
+        if 'send_threading' in self.config['node']:
+            self.send_threading = self.config['node']['send_threading']
+        else:
+            self.send_threading = False
         if 'send_type' in self.config['node']:
             self.send_type = self.config['node']['send_type']
         else:
