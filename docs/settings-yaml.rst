@@ -4,7 +4,6 @@ imagenode Settings and the imagenode.yaml file
 
 .. contents::
 
-========
 Overview
 ========
 
@@ -190,6 +189,7 @@ There is 5 optional ``node`` settings:
   patience: maximum number of seconds to wait for a reply from imagehub
   stall_watcher: True or False to start a 'stall_watcher' sub-process
     (default is False)
+  send_threading: True or False to send images & messages in a separate thread
   queuemax: maximum size of the queue for images, messages, etc.
   print_settings: True or False to print the settings from imagenode.yaml
     (default is False)
@@ -241,6 +241,16 @@ checks. If no ``patience`` value is provided, the default is 10 seconds. If
 this option is set to ``False`` or is not present, there is no separate
 stall watching process started.
 
+If the ``send_threading`` setting is set to ``True``, then a separate thread
+is started to send (message, image) pairs to the **imagehub**. The default is
+``False``. When this setting is absent or ``False``, all camera reading and
+(message, image) sending is done serially in the same forever loop (see
+imagenode.py main loop). When the setting is ``True``, the ``send_q`` is an
+instance of the SendQueue class, which causes the ``node.read_cameras()`` while
+loop to run forever in the main program. No sending of (message, image) pairs is
+done in the main program. Instead, the sending of (message, image) pairs
+is done in a separate thread. This can result in somewhat higher FPS throughput.
+
 The ``queuemax`` setting sets the length of the queues used to hold images,
 messages, etc. Default is 50; setting it to a larger value will allow more
 images to be stored and sent for each event, but will use more memory.
@@ -284,9 +294,12 @@ those shown below:
     resolution: (640,480)
     exposure_mode: night
     framerate: 8
+    iso: 800 # default = 0 for auto
+    shutter_speed: 1500 # microseconds - default = 0 for auto
     vflip: False
     resize_width: 80
     send_type: jpg   # or image
+    print_settings: True # default = False
     detectors:
       motion:
         ROI: (70,2),(100,25)
@@ -316,7 +329,8 @@ Note that most webcams have preset fixed values for resolution, framerate,
 etc. that cannot be changed. Check the docs for your webcam and test it with
 cv2.VideoCapture(). PiCameras will typically use settings for resolution and
 framerate, but many other settings, such as 'exposure_mode = sports' can be
-set if needed. See the PiCamera readthedocs for the detailed API.
+set if needed. See the PiCamera readthedocs for the detailed API. There is a
+section below specifically for PiCamera settings.
 
 ``viewname`` is an optional setting. It is required when there are multiple
 cameras to give each one a unique viewname. For example, the node could be named
@@ -329,13 +343,6 @@ camera's images would be named 'JeffOffice door'.
 above. Typical values are (320, 240) and (640, 480). The default if none is
 specified is (320, 240).
 
-``exposure_mode`` is an optional setting for PiCameras. It sets the PiCamera
-exposure_mode to a number of available choices, such as ``auto``, ``night``,
-and ``sports``. The details of these exposure modes are in the PiCamera
-readthedocs or you can type ``raspistill --help`` at a CLI prompt on a
-Raspberry Pi computer for a list. If no ``exposure_mode`` is specified, then
-the default is ``auto``.
-
 ``vflip`` is an optional setting. If the camera image needs to be vertically
 flipped, set ``vflip: True``. The default if not present is ``False``.
 
@@ -345,11 +352,13 @@ desired width. The width is an integer percentage value from 0 to 99.
 For example, ``resize_width: 80`` would reduce the width 80%, and the height
 proportionally, keeping the same aspect ratio.
 
-```send_frames`` is an optional setting. If set to ``continuous``, then images
+``send_frames`` is an optional setting. If set to ``continuous``, then images
 are sent continuously as they are read from the camera. If set to ``event``
 then images are sent when an event occurs, such as motion detected or a light
 level change detected. If set to ``none``, then images are never sent from the
-camera (useful when testing other sensors, for example).
+camera. For example, if ``send_frames`` is set to ``none``, and a motion
+detector is specified, then motion event messages will be sent when motion is
+detected, but images will not be sent.
 
 ``src`` is an optional setting that only applies to webcams, not PiCameras. If
 a webcam is being specified, ``src`` is set to 0 or 1 or 2, etc. This value is
@@ -359,15 +368,94 @@ set the ``src`` value to the next integer for each webcam. You may have to do
 some testing to determine which cv2.VideoCapture(src) value is assigned to which
 webcam.
 
-``send_debug`` is an optional setting.  Typically, each camera sends each image in
-its natural color state, with no intermediate computed images being sent. Examples
-of computed images include grayscale, motion difference, thresholded, etc. When
-tuning a detector, it is helpful to send computed images along with the natural
-color images. The ``send_debug`` setting allows choosing which computed image
-types to send. For example, ``send_debug = (grayscale, threshold)`` would send the
-computed grayscale and the computed threshold images in addition to the
-natural color images. The choices for computed images are different for each
-detector; see the detector section for more details.
+PiCamera Specific Settings
+--------------------------
+
+There a many camera settings available on PiCameras, including the ability to
+set an automatic exposure mode such as ``night`` or ``sports``. There are also
+a number of very "manual" PiCamera settings, such as ``iso`` and
+``shutter_speed``. The details of these exposure modes are in the
+`PiCamera readthedocs <https://picamera.readthedocs.io/en/release-1.10/api_camera.html>`_.
+You can also type ``raspistill --help`` at a CLI prompt on a
+Raspberry Pi computer for a list of these settings and allowed values.
+
+Below is the list of PiCamera specific settings that can be specified in the
+YAML settings file. A couple of these, ``iso`` and ``shutter_speed`` are
+shown in the example above.
+
+``awb_mode`` retrieves or sets the auto-white-balance mode of the camera.
+The default value is ``auto``.  The other possible values are:
+``off, auto, sunlight, cloudy, shade, tungsten, fluorescent, incandescent,
+flash, horizon``.
+
+``awb_gains`` is an optional setting for the auto-white-balance gains of the
+camera.  When queried, the output is expressed as Fraction instances of
+a (red, blue) tuple. Typical values for the gains are between 0.9 and 1.9,
+and this attribute only has an effect when ``awb_mode`` is set to ``off``.
+
+``brightness`` is an optional setting for the brightness of the camera.
+The default value is ``50``, and the value can be set to an integer between 0
+and 100.
+
+``contrast`` is an optional setting for the contrast of the camera.
+The default value is ``0``, and the value can be set to an integer between
+-100 and 100.
+
+``exposure_compensation`` is an optional setting for adjusting the exposure
+compensation level. Each increment represents 1/6th of a stop. Hence, setting
+the attribute to 6 increases exposure by 1 stop. The default value is ``0``,
+and the value can be set to an integer between -25 and 25.
+
+``exposure_mode`` retrieves or sets the PiCamera's automatic
+exposure_mode. The default is ``auto``. The possible values are:
+``off, auto, night, nightpreview, backlight, spotlight, sports, snow, beach,
+verylong, fixedfps, antishake, fireworks``.
+
+``iso`` retrieves or sets the apparent ISO setting of the camera. This setting
+behaves differently for camera module versions V1 and V2. Only the V2 camera
+modules are calibrated against the ISO film speed standards.
+The default is ``0`` for automatic ISO setting. Allowed falues are:
+``0, 100, 200, 320, 400, 500, 640, 800``.
+
+``meter_mode`` is an optional setting used to adjust the camera's metering mode.
+All modes set up two regions: a center region, and an outer region. The major
+difference between each mode is the size of the center region. The ``backlit``
+mode has the largest central region (30% of the width), while ``spot`` has the
+smallest (10% of the width). The default value is ``average``, and the other possible
+values include the following: ``average, spot, backlit, matrix``.
+
+``saturation`` is an optional setting to adjust the saturation of the camera.
+The default value is ``0``, and the value can be set to an integer between -100
+and 100.
+
+``sharpness`` an optional setting to adjust the sharpness of the camera.
+The default value is ``0``, and the value can be set to an integer between -100
+and 100.
+
+``shutter_speed`` is an optional setting for the shutter speed in microseconds.
+The default value is ``0`` for auto, and the value can range as an integer from
+0 to 33,333 microseconds (depending on the camera module firmware).
+
+PiCamera Read-Only Parameters
+-----------------------------
+
+The following read-only parameters can be retrieved by using
+``print_settings = True`` in the ``node`` section of the ``imagenode.yaml`` file.
+
+``analog_gain`` retrieves the current analog gain of the camera. The value is
+returned as a ``Fraction`` instance (read-only).
+
+``digital_gain`` retrieves the current digital gain of the camera. This
+parameter returns the digital gain currently used by the camera. It provides
+valuable feedback on the effects of varying other PiCamera parameters (read-only).
+
+``exposure_speed`` retrieves the current shutter speed of the camera.
+If the ``shutter_speed`` was set to a non-zero value, then ``exposure_speed`` will
+equal ``shutter_speed``. The is returned in microseconds (read-only).
+
+``revision`` returns a string representing the revision of the Pi’s camera
+module. The read-only values returned include the following:
+``ov5647 = V1, imx219 = V2, imx477 = HQ``.
 
 See the "Camera Detectors, ROI and Event Tuning" section below for details on
 how detectors, events and related settings are defined and implemented for each
@@ -639,47 +727,134 @@ affect how it is recorded:
    these additional test images improves tuning the options to the desired
    motion detection level.
 
+Specifying **Multiple** Camera Detectors of the Same Type
+=========================================================
+Multiple Regions of Interest (ROI) are possible with the same detector. For example,
+if a region, such as the sidewalk approaching your front door, is of special interest,
+this region can be defined and named in order to generate log notifications for that
+specific ROI.
+
+.. image:: images/multiple-roi-image.jpg
+
+In the example yaml file below, a log event will be generated indicating motion at the
+FrontDoor (e.g. "**2020-10-16 20:53:39,727 ~ StreetView RPiCam6|motion|moving|FrontDoor**").
+When using duplicate detector types, such as motion, each detector entry must be preceeded
+by a '-' and space as shown below. Each detector section must have a ``roi_name`` and
+``log_roi_name`` parameter.  Log events these ROIs will have the ``roi_name`` concatenated
+to the end of each associated event in the log file if the ``log_roi_name`` is
+enabled (default: False).
+
+.. code-block:: yaml
+
+	# Settings for imagenode.py webcam motion detector testing
+	---
+	node:
+	  name: StreetView
+	  queuemax: 50
+	  patience: 15
+	  heartbeat: 1
+	  send_type: jpg
+	  #send_threading: True  # sends images in separate thread
+	  #stall_watcher: True  # watches for stalled network or RPi power glitch
+	  print_settings: True
+	hub_address:
+	  H1: tcp://10.0.0.228:5555
+	cameras:
+	  P1:
+		viewname: RPiCam6
+		resolution: (640,480)
+		exposure_mode: auto
+		framerate: 30
+		detectors:
+		  - motion:
+			 ROI: (4,21),(86,51)
+			 roi_name: Street
+			 log_roi_name: False # default False
+			 draw_roi: ((0,255,0),1)
+			 send_frames: detected event # continuous, none or detected event
+			 send_count: 7 # number of images to send when an event occurs
+			 delta_threshold: 7
+			 min_motion_frames: 5
+			 min_still_frames: 5
+			 min_area: 3
+			 blur_kernel_size: 21
+			 send_test_images: False
+			 print_still_frames: False  # default = True
+			 draw_time: ((0,200,0),1)
+			 draw_time_org: (5,5)
+			 draw_time_fontScale: 0.5
+		  - motion:
+			 ROI: (23,52),(81,90)
+			 roi_name: FrontDoor
+			 log_roi_name: True  # default False
+			 draw_roi: ((0,255,0),1)
+			 send_frames: detected event # continuous, none or detected event
+			 send_count: 7 # number of images to send when an event occurs
+			 delta_threshold: 7
+			 min_motion_frames: 5
+			 min_still_frames: 5
+			 min_area: 3  # minimum area of motion as percent of ROI
+			 blur_kernel_size: 21  # Guassian Blur kernel size - integer and odd
+			 send_test_images: False
+			 print_still_frames: False  # default = True
+
+Note:  If multiple detectors are used of different types (e.g. motion and light),
+then the '-' and space is not required. However, mixed syntax is not allowed. In other words,
+each detector must have a '-' and space or NOT, unless duplicate types are used,
+and in that case each detector must have a '-' and space preceding each entry.
+
 =========================================================================
 Settings for Sensor Detectors, including temperature and humidity sensors
 =========================================================================
 
 Raspberry Pi computers can have various sensors attached to the GPIO pins.
 The two types I have used are the DS18B20 "1 wire" temperature sensors and the
-DHT temperature / humidity sensors. There is ongoing testing with DHT22 temperature
-and humidity combined sensors and other sensors such as PIR (passive infrared)
-sensors for motion detection. That code will be added to the repository when it
-has been more thoroughly tested. Sensors use the RPi.GPIO module and can only
-be run on Raspberry Pi computers.
+DHT temperature / humidity sensors. There is ongoing testing other kinds of
+sensors such as PIR (passive infrared) sensors for motion detection. That code
+will be added to the repository when it has been more thoroughly tested. Sensors
+use the RPi.GPIO module and can only be run on Raspberry Pi computers.
 
-There are 5 options to set up reading the temperature DS18B20 sensor:
+There are 5 options to set when using DS18B20 or DHT22 sensors:
 
 .. code-block:: yaml
 
-  name: Temperature
-  type: DS18B20
-  gpio: 4
-  read_interval_minutes: 30
-  min_difference: 1
+  sensors:
+    T1:
+      name: Temperature
+      type: DS18B20
+      gpio: 4  # note that the DS18B20 can only be used on GPIO pin 4
+      read_interval_minutes: 10  # check temperature every X minutes
+      min_difference: 1  # send reading when changed by X degrees
+    T2:
+      name: Temperature & Humidity
+      type: DHT22
+      gpio: 18
+      read_interval_minutes: 10  # check temperature every X minutes
+      min_difference: 1  # send reading when changed by X degrees
 
-1. name: The name you specify here will be the name that is put into the event
-   log messages recorded by the hub.
-2. type: DS18B20 is the only choice for now; others are in testing
-3. gpio: Which GPIO pin reads the sensor. Pin 4 is the one most commonly
-   used for "one-wire" sensors like the DS18B20
+
+1. name: This is a descriptive name for the sensor.
+2. type: DS18B20, DHT11 and DHT22 are the currently supported sensors.
+3. gpio: Which GPIO pin reads the sensor. Pin 4 must be
+   used for "one-wire" sensors like the DS18B20. Any GPIO pin can be used for
+   DHT11 or DHT22 sensors.
 4. read_interval_minutes: How often the sensor measurements should be read,
    specified in minutes
-5. min_difference: The minimum temperature change from the last reading that
+5. min_difference: The minimum change from the last reading that
    will cause an event message to be sent to the hub. Typically set to 1 or 2
-   degrees.
+   degrees. The setting will apply to humidity minimum change on DHT11 or DHT22
+   sensors.
 
 When the sensor takes a reading that meets the ``min_difference`` requirement,
 a message of this format is placed into the ``send_q`` for sending to the hub::
 
   Barn |temperature | 75 F
+  Deck |temperature | 75.4 F
+  Deck |humidity | 48.4 %
 
 The temperature readings are not taken during the main event loop that captures,
-processes and sends images. Instead, the check_temperature() function uses a
-separate Python thread that reads the temperature probe
+processes and sends images. Instead, the check_temperature() function runs in  a
+separate Python thread that reads the temperature sensor
 at intervals specified by the ``read_interval_minutes`` option.
 
 ===============================================
