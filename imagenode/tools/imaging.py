@@ -113,12 +113,6 @@ class ImageNode:
         self.camlist = []  # need an empty list if there are no cameras
         if settings.cameras:  # is there at least one camera in yaml file
             self.setup_cameras(settings)
-
-        # open ZMQ link to imagehub
-        # use either of the formats below to specifiy address of display computer
-        # sender = imagezmq.ImageSender(connect_to='tcp://jeff-macbook:5555')
-        # self.sender = imagezmq.ImageSender(connect_to='tcp://192.168.1.190:5555')
-        self.sender = imagezmq.ImageSender(connect_to=settings.hub_address)
         
         # if configured, bind to specified port as imageZMQ publisher 
         # this provides for optional continuous image publishing by camera
