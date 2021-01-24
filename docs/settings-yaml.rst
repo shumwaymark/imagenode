@@ -186,7 +186,8 @@ There is 5 optional ``node`` settings:
 .. code-block:: yaml
 
   heartbeat: an integer number of minutes; how often to send a heartbeat to hub
-  patience: maximum number of seconds to wait for a reply from imagehub
+  patience: maximum number of seconds to wait for a reply from
+  REP_watcher: True or False to start a REP_watcher thread (default is True)
   stall_watcher: True or False to start a 'stall_watcher' sub-process
     (default is False)
   send_threading: True or False to send images & messages in a separate thread
@@ -217,13 +218,25 @@ between **imagenode** and **imagehub** is reliable for weeks. The ZMQ protocol
 can recover from brief network outages almost all of the time. But some network
 outages (e.g., brief power outages that confuse routers or wifi hubs) can cause
 the ZMQ protocol to hang. The ``patience`` setting specifies how long to wait
-for a hub response before calling the ``fix_comm_link`` function that will retry
-a non-responsive message and then try to correct the issue (restart the WiFi
-connection, restart the ZMQ link, restart the Raspberry Pi itself, etc.). If
-you do not specify an ``patience`` value, the default is 10 seconds.
+in seconds. The options ``REP_watcher`` and ``stall_watcher`` use the
+``patience`` value to determine how long to wait if they detect a failure.  If
+you do not specify a ``patience`` value, the default is 10 seconds.
+
+If the ``REP_watcher`` setting is set to ``True``, then a thread is
+started that watches the ZMQ communication channel for "no REP received". One
+disadvantage of the REQ/REP ZMQ messaging pattern is that it can "stall" if
+the imagehub is restarted or if there is a brief network outage.
+As mentioned in the above ``patience`` option, the communications link
+between **imagenode** and **imagehub** is often reliable for weeks. But if the
+imagehub restarts itself or the ZMQ link gets out of sync, a REP may never be
+received and the send_frame function will stall forever. Setting
+this option to ``True`` will start a thread that tracks the time
+of each REQ and each REP. Then, if a REP is not received for ``patience``
+seconds, the fix_comm_link() method will be called. The default for
+``REP_watcher`` is ``True``.
 
 If the ``stall_watcher`` setting is set to ``True``, then a sub-process is
-started that watches the main process for "slow downs" or "stalls".
+started that watches the main imagenode process for "slow downs" or "stalls".
 As mentioned in the above ``patience`` option, the communications link
 between **imagenode** and **imagehub** is often reliable for weeks. The ZMQ protocol
 can recover from brief network outages almost all of the time. But some network
@@ -237,9 +250,32 @@ the ``stall_watcher`` option is set to ``True``, the 2nd process will end the
 service can restart **imagenode**. An example **imagenode.service** file that
 provides for restarting (using systemd / systemctl) is in the main directory.
 The ``patience`` option (above) sets the number of seconds between "stall"
-checks. If no ``patience`` value is provided, the default is 10 seconds. If
-this option is set to ``False`` or is not present, there is no separate
-stall watching process started.
+checks. The default for ``stall_watcher`` is ``False``.
+
+All 4 of the above options are about longer term reliability of **imagenodes** when
+running for long periods of time in a production environment. My **imagenodes** are
+Raspberry Pi computers that are often outside and often a long distance from the
+**imagehubs**. Some are more than one router hop away from the **imagehubs**. Some of
+the Raspberry Pi computers seem to be more sensitive to power "brownouts" or brief
+outages. Some of the routers are more subject to brief glitches than others.
+Some WiFi routers seem to go into a power saving mode when an RPi hasn't sent a
+message / image for a while. I have spent over 2 years adding and testing the
+above "reliability" options. Here are the settings that have worked best for me:
+
+1. ``heartbeat`` set to 10 (minutes).
+2. ``patience`` set to 5 (seconds).
+3. ``REP_watcher`` set to ``True``. I set this in all my "production" RPi
+   **imagnodes**. It checks for "no REP received", which is the most common
+   source of stalls, including stalls caused by a restart of the **imagehub**.
+4. ``stall_watcher`` set to ``False`` unless a particular RPi hangs
+   occasionally (rare, but happens). Then I set ``stall_watcher`` to ``True``
+   for that particular RPi and observe it longer term. ``stall_watcher`` uses
+   more resources (a separate process) and checks for stalls that are not as
+   simple as "no REP after a REQ". Using ``stall_watcher`` has helped me
+   identify RPi's that were slowly failing due to electronic issues, heat
+   issues, SD card issues, etc. If ``stall_watcher`` is set, it is still
+   necessary to set ``REP_watcher`` as well because they check for different
+   kinds of stalls.
 
 If the ``send_threading`` setting is set to ``True``, then a separate thread
 is started to send (message, image) pairs to the **imagehub**. The default is
@@ -249,7 +285,7 @@ imagenode.py main loop). When the setting is ``True``, the ``send_q`` is an
 instance of the SendQueue class, which causes the ``node.read_cameras()`` while
 loop to run forever in the main program. No sending of (message, image) pairs is
 done in the main program. Instead, the sending of (message, image) pairs
-is done in a separate thread. This can result in somewhat higher FPS throughput.
+is done in a separate thread. This can result in higher FPS throughput.
 
 The ``queuemax`` setting sets the length of the queues used to hold images,
 messages, etc. Default is 50; setting it to a larger value will allow more
@@ -341,16 +377,25 @@ camera's images would be named 'JeffOffice door'.
 
 ``resolution`` is an optional setting. It is specified as a tuple as shown
 above. Typical values are (320, 240) and (640, 480). The default if none is
-specified is (320, 240).
-
-``vflip`` is an optional setting. If the camera image needs to be vertically
-flipped, set ``vflip: True``. The default if not present is ``False``.
+specified is (320, 240). It is important to select a resolution that is native
+to your camera (piCamera or webcam) as results can be unpredictable for
+non-native resolution sizes, depending on the camera. Native resolution sizes
+can be obtained from the camera's documentation.
 
 ``resize_width`` is an optional setting. It allows for resizing the image,
 keeping the same aspect ratio, but reducing the image size by specifying the
 desired width. The width is an integer percentage value from 0 to 99.
 For example, ``resize_width: 80`` would reduce the width 80%, and the height
-proportionally, keeping the same aspect ratio.
+proportionally, keeping the same aspect ratio. Note that resizing uses the
+OpenCV resize method with CV2.INTER_AREA which is best for shrinking image
+sizes rather than increasing them. Resizing is computationally expensive and
+will slow down Frames per Second (FPS) rates. Setting a resolution (see above)
+is a more computationally friendly way select an image size. Resizing can also
+be done at the image receiving end to avoid the resizing computation load on the
+imagenode.
+
+``vflip`` is an optional setting. If the camera image needs to be vertically
+flipped, set ``vflip: True``. The default if not present is ``False``.
 
 ``send_frames`` is an optional setting. If set to ``continuous``, then images
 are sent continuously as they are read from the camera. If set to ``event``
@@ -359,6 +404,14 @@ level change detected. If set to ``none``, then images are never sent from the
 camera. For example, if ``send_frames`` is set to ``none``, and a motion
 detector is specified, then motion event messages will be sent when motion is
 detected, but images will not be sent.
+
+``threaded_read`` is an optional setting. If set to ``True``, then capturing
+camera images is done in a separate thread and will result in higher Frames per
+Second (FPS). The imutils.VideoStream module is used to do threaded camera
+reading. If set to ``False``, then the PiCamera is read a single frame at a
+time by the ImageNode.read_cameras() method. The ``False`` setting only
+applies to PiCameras and is normally used for testing an imagenode. The default
+setting is ``True``.
 
 ``src`` is an optional setting that only applies to webcams, not PiCameras. If
 a webcam is being specified, ``src`` is set to 0 or 1 or 2, etc. This value is
@@ -517,18 +570,38 @@ For example, if the original image size is 640 x 480, then:
   and 85 percent from the top of the frame. In pixels, that would be
   ((96,144),(448,408)) for an original image size of 640 x 480.
 
-A detector can also draw the ROI rectangle onto the images that are sent by
+A detector can also **draw the ROI rectangle** onto the images that are sent by
 specifying the color of the rectangle and the pixel width of the drawing line.
 For example:
 
 .. code-block:: yaml
 
-  draw_roi: ((255,0,0),5)
+  draw_roi: ((255,0,0),5)  # specifies a blue ROI box with a line 5 pixels wide
 
 would draw the ROI rectangle on the sent images as a blue line that is 5 pixels
 wide. The syntax for specifying the rectangle color and line width is the same
 as the cv2.rectangle() drawing function. The cv2.rectangle() drawing function
 is used to draw the rectangle on each image before sending.
+
+There are optional detector settings to **draw an image capture timestamp value**
+directly on the image. These options are typically used for testing and
+debugging of detector settings as they can significantly slow down FPS in
+production. The syntax for specifying the rectangle color and line width is the
+same as the cv2.rectangle() drawing function. To draw a timestamp of capture
+time directly on the image, use these detector section options:
+
+.. code-block:: yaml
+
+  draw_time: ((255,0,0),1)  # the timestamp text is blue with 1 pixel line width
+  draw_time_org: (1,1)  # the timestamp text starts at pixel (1,1)
+  draw_time_fontScale: 1  # the timestamp fontScale factor is 1
+
+The timestamp option uses the OpenCV cv2.putText() method, and the options above
+are the same as the settings for that method. You can read more about the
+settings in the OpenCV cv2.putText() documentation. Note that the timestamp is
+formatted to microseconds using the datetime.isoformat(timespec='microseconds')
+that was added in Python 3.6, so you will need to be running Python version 3.6
+or later to used the ``draw_time`` option.
 
 Settings for the **light** detector
 ===================================

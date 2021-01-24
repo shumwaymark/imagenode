@@ -4,6 +4,7 @@ Copyright (c) 2017 by Jeff Bass.
 License: MIT, see LICENSE for more details.
 """
 
+import os
 import sys
 import time
 import signal
@@ -47,11 +48,8 @@ def versionCompare(v1, v2):
     		return -1
     return 0
 
-def clean_shutdown_when_killed(signum, *args):
+def clean_shutdown_when_killed(signum=signal.SIGTERM, *args):
     """Close all connections cleanly and log shutdown
-    This function will be called when SIGTERM is received from OS
-    or if the program is killed by "kill" command. It then raises
-    KeyboardInterrupt to close all resources and log the shutdown.
     """
     logging.warning('SIGTERM detected, shutting down')
     sys.exit()
@@ -79,31 +77,3 @@ def interval_timer(interval, action):
         except Exception:
             logging.exception('Error in interval_timer')
         next_time += (time.time() - next_time) // interval * interval + interval
-
-class Patience:
-    """Timing class using system ALARM signal.
-
-    When instantiated, starts a timer using the system SIGALRM signal. To be
-    used in a with clause to allow a blocking task to be interrupted if it
-    does not return in specified number of seconds.
-
-    See main event loop in Imagenode.py for Usage Example
-
-    Parameters:
-        seconds (int): number of seconds to wait before raising exception
-    """
-    class Timeout(Exception):
-        pass
-
-    def __init__(self, seconds):
-        self.seconds = seconds
-
-    def __enter__(self):
-        signal.signal(signal.SIGALRM, self.raise_timeout)
-        signal.alarm(self.seconds)
-
-    def __exit__(self, *args):
-        signal.alarm(0)    # disable alarm
-
-    def raise_timeout(self, *args):
-        raise Patience.Timeout()

@@ -14,18 +14,17 @@ License: MIT, see LICENSE for more details.
 Added support for asynchronous logging over PyZMQ 
 """
 
+import os
 import sys
 import signal
 import logging
 import logging.handlers
 import traceback
-from tools.utils import clean_shutdown_when_killed
-from tools.utils import Patience
-from tools.imaging import Settings
-from tools.imaging import ImageNode
 import json
 import socket
 from zmq.log.handlers import PUBHandler
+from tools.utils import clean_shutdown_when_killed, Patience
+from tools.imaging import Settings, ImageNode
 
 def main():
     # set up controlled shutdown when Kill Process or SIGTERM received
@@ -44,24 +43,19 @@ def main():
             while not node.send_q:
                 node.read_cameras()
             while len(node.send_q) > 0:  # send frames until send_q is empty
-                try:
-                    with Patience(settings.patience):
-                        text, image = node.send_q.popleft()
-                        hub_reply = node.send_frame(text, image)
-                except Patience.Timeout:  # if no timely response from hub
-                    log.info('No imagehub reply for '
-                        + str(int(settings.patience)) + ' seconds')
-                    hub_reply = node.fix_comm_link()
+                text, image = node.send_q.popleft()
+                hub_reply = node.send_frame(text, image)
                 node.process_hub_reply(hub_reply)
-    except (KeyboardInterrupt, SystemExit):
-        log.warning('Ctrl-C was pressed or SIGTERM was received.')
+    except KeyboardInterrupt:
+        log.warning('Ctrl-C was pressed.')
+    except SystemExit:
+        log.warning('SIGTERM was received.')
     except Exception as ex:  # traceback will appear in log
         log.exception('Unanticipated error with no Exception handler.')
     finally:
         if 'node' in locals():
             node.closeall(settings) # close cameras, GPIO, files
         log.info('Exiting imagenode.py')
-        sys.exit()
 
 def start_logging():
     log = logging.getLogger()
