@@ -3,15 +3,11 @@ Also reads settings from imagenode.yaml file.
 
 Copyright (c) 2017 by Jeff Bass.
 License: MIT, see LICENSE for more details.
-
-19-Apr-2020, Mark.Shumway@swanriver.dev -
-Added setting to define port for log publishing
 """
 
 import os
 import sys
 import yaml
-import json
 import pprint
 import signal
 import logging
@@ -32,8 +28,7 @@ from tools.utils import interval_timer
 from tools.nodehealth import HealthMonitor
 from tools.utils import versionCompare
 from pkg_resources import require
-from sentinelcam.utils import FPS
-from pyimagesearch.centroidtracker import CentroidTracker
+from sentinelcam.outpost import Outpost # SentineCam outpost support
 
 
 class ImageNode:
@@ -113,11 +108,6 @@ class ImageNode:
         self.camlist = []  # need an empty list if there are no cameras
         if settings.cameras:  # is there at least one camera in yaml file
             self.setup_cameras(settings)
-        
-        # if configured, bind to specified port as imageZMQ publisher 
-        # this provides for optional continuous image publishing by camera
-        if settings.publish_cams:
-            self.publisher = imagezmq.ImageSender("tcp://*:{}".format(settings.publish_cams), REQ_REP=False)
 
         # Read a test image from each camera to check and verify:
         # 1. test that all cameras can successfully read an image
@@ -392,12 +382,6 @@ class ImageNode:
             camera.cam_q.append(image)
             for detector in camera.detectors:
                 self.run_detector(camera, image, detector)
-            if camera.video:
-                ret_code, jpg_buffer = cv2.imencode(
-                    ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 
-                    self.jpeg_quality])
-                self.publisher.send_jpg(camera.text, jpg_buffer)
-                camera.velocity.update()
 
     def run_detector(self, camera, image, detector):
         """ run detector on newest image and detector queue; perform detection
@@ -866,11 +850,6 @@ class Camera:
             self.awb_mode = cameras[camera]['awb_mode']
         else:
             self.awb_mode = 'auto'  # default value
-        if 'video' in cameras[camera]:
-            self.video = cameras[camera]['video']
-            self.velocity = FPS()
-        else:
-            self.video = False
 
         self.detectors = []
         if 'detectors' in cameras[camera]:  # is there at least one detector
@@ -1017,14 +996,9 @@ class Detector:
             else:
                 self.print_still_frames = True  # True is default print_still_frames
 
-        elif detector == 'tracker':
-            self.detect_state = self.object_tracker
-            self.log = logging.getLogger()
-            self.event = 0
-            # instantiate centroid tracker
-            self.ct = CentroidTracker(maxDisappeared=15, maxDistance=100)
-            # initialize the MOG foreground background subtractor
-            self.mog = cv2.bgsegm.createBackgroundSubtractorMOG()
+        elif detector == 'outpost':
+            self.outpost = Outpost(self, detectors[detector], nodename, viewname)
+            self.detect_state = self.outpost.object_tracker
 
         if 'ROI' in detectors[detector]:
             self.roi_pct = literal_eval(detectors[detector]['ROI'])
@@ -1345,83 +1319,6 @@ class Detector:
             text_and_image = (text, state_image)
             send_q.append(text_and_image)
 
-    def object_tracker(self, camera, image, send_q):
-        """ Detect if ROI is 'moving' or 'still'; send event message and images
-
-        Parameters:
-            camera (Camera object): current camera
-            image (OpenCV image): current image
-            send_q (Deque): where (text, image) tuples are appended to be sent
-
-        This function borrowed a lot from a motion detector tutorial post by
-        Adrian Rosebrock on PyImageSearch.com. See README.rst for details.
-        """
-        # initialize a list to store the bounding box rectangles returned
-        # by background subtraction model
-        rects = []
-        state = self.current_state
-
-        # crop to ROI
-        x1, y1 = self.top_left
-        x2, y2 = self.bottom_right
-        ROI = image[y1:y2, x1:x2]
-
-        # convert to grayscale and smoothen using gaussian kernel
-        gray = cv2.cvtColor(ROI, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        # apply the MOG background subtraction model
-        mask = self.mog.apply(gray)
-
-        # apply a series of erosions to break apart connected
-        # components, then find contours in the mask
-        erode = cv2.erode(mask, (7, 7), iterations=2)
-        cnts = cv2.findContours(erode.copy(), cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE)
-        cnts = imutils.grab_contours(cnts)
-
-        # loop over each contour
-        for c in cnts:
-            # if the contour area is less than the minimum area
-            # required then ignore the object
-            if cv2.contourArea(c) < 1000:
-                continue
-
-            # compute the bounding box coordinates of the contour
-            (x, y, w, h) = cv2.boundingRect(c)
-            (startX, startY, endX, endY) = (x, y, x + w, y + h)
-
-            # add the bounding box coordinates to the rectangles list
-            rects.append((startX, startY, endX, endY))
-        
-        if len(rects) > 0:
-            state = "moving"
-            if state != self.last_state:
-                self.event += 1
-                self.ote = {'id': self.event, 'evt': 'start',
-                    'view': camera.viewname, 'fps': camera.velocity.fps()}
-                self.log.info('ote' + json.dumps(self.ote))
-                del self.ote['fps'] # only needed for start event
-
-        # update centroid tracker and loop over the tracked objects
-        objects = self.ct.update(rects)
-        if len(objects) > 0:
-            self.ote['evt'] = 'trk' 
-            for (objectID, centroid) in objects.items():
-                self.ote['obj'] = int(objectID)
-                self.ote['cent'] = [int(centroid[0] + x1), int(centroid[1] + y1)]
-                self.log.info('ote' + json.dumps(self.ote))
-        
-        if len(self.ct.objects) == 0:
-            state = "still"
-            if self.last_state == "moving":
-                self.ote['evt'] = 'end'
-                self.log.info('ote' + json.dumps(self.ote))
-
-        self.current_state = state
-        # Now that current state has been sent, it becomes the last_state
-        self.last_state = self.current_state
-
 class Settings:
     """Load settings from YAML file
 
@@ -1494,14 +1391,6 @@ class Settings:
             self.send_type = self.config['node']['send_type']
         else:
             self.send_type = 'jpg'  # default send type is jpg
-        if 'publish_log' in self.config['node']:
-            self.publish_log = self.config['node']['publish_log']
-        else:
-            self.publish_log = False
-        if 'publish_cams' in self.config['node']:
-            self.publish_cams = self.config['node']['publish_cams']
-        else:
-            self.publish_cams = False
         if 'cameras' in self.config:
             self.cameras = self.config['cameras']
         else:

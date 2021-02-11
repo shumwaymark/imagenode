@@ -9,7 +9,7 @@ class FPS:
 
 	def update(self):
 		# capture current timestamp
-		self._deque.append(datetime.datetime.now())
+		self._deque.append(datetime.datetime.utcnow())
 	
 	def fps(self):
 		# calculate and return estimated frames/sec
