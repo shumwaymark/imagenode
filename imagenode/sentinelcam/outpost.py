@@ -100,6 +100,7 @@ class Outpost:
 
         """
         if self.publish_cam:
+            self._rate.update()
             ret_code, jpg_buffer = cv2.imencode(".jpg", image, 
                 [int(cv2.IMWRITE_JPEG_QUALITY), camera.jpeg_quality])
             Outpost.publisher.send_jpg(camera.text, jpg_buffer)
@@ -169,4 +170,3 @@ class Outpost:
         self.detector.current_state = state
         # Now that current state has been sent, it becomes the last_state
         self.detector.last_state = self.detector.current_state
-        # self._rate.update()
