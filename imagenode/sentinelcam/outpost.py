@@ -150,7 +150,6 @@ class Outpost:
                     'view': camera.viewname, 'fps': self._rate.fps()}
                 logging.info('ote' + json.dumps(self.ote))
                 del self.ote['fps']  # only needed for start _event
-                del self.ote['view'] # only needed for start _event
 
         # update centroid tracker and loop over the tracked objects
         objects = self.ct.update(rects)
