@@ -14,6 +14,7 @@ import uuid
 import sys
 import zmq
 import imagezmq
+import simplejpeg
 from zmq.log.handlers import PUBHandler
 from sentinelcam.utils import FPS
 from sentinelcam.centroidtracker import CentroidTracker
@@ -101,8 +102,11 @@ class Outpost:
         """
         if self.publish_cam:
             self._rate.update()
-            ret_code, jpg_buffer = cv2.imencode(".jpg", image, 
-                [int(cv2.IMWRITE_JPEG_QUALITY), camera.jpeg_quality])
+            #ret_code, jpg_buffer = cv2.imencode(".jpg", image, 
+            #    [int(cv2.IMWRITE_JPEG_QUALITY), camera.jpeg_quality])
+            jpg_buffer = simplejpeg.encode_jpeg(image, 
+                quality=camera.jpeg_quality, 
+                colorspace='BGR')
             Outpost.publisher.send_jpg(camera.text, jpg_buffer)
 
         # initialize a list to store the bounding box rectangles returned
