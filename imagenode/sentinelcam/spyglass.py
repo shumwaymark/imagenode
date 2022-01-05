@@ -13,12 +13,14 @@ import json
 import traceback
 import cv2
 import imutils
+import imagezmq
 import numpy as np
 import multiprocessing
-from datetime import datetime
 from multiprocessing import sharedctypes
+from datetime import datetime
 from collections import OrderedDict
 from scipy.spatial import distance as dist
+import zmq
 
 class ParseYOLOOutput:
 	def __init__(self, conf):
@@ -394,9 +396,32 @@ class CentroidTracker:
 		# return the set of trackable objects
 		return self.objects
 
+class LensWire:
+    def __init__(self, port) -> None:
+        self._wire = imagezmq.ImageSender(f"tcp://127.0.0.1:{port}")
+        self._poller = zmq.Poller()
+        self._poller.register(self._wire.zmq_socket, zmq.POLLIN)
+
+    def ready(self) -> bool:
+        events = dict(self._poller.poll(0))
+        if self._wire.zmq_socket in events:
+            return events[self._wire.zmq_socket] == zmq.POLLIN
+        else:
+            return False
+    
+    def send(self, lenstype) -> None:
+        self._wire.zmq_socket.send_string(lenstype)
+    
+    def recv(self) -> tuple:
+        return self._wire.zmq_socket.recv_pyobj()
+
+    def __del__(self) -> None:
+        self._wire.close()
+
 class LensTasking:
 
     FAIL_LIMIT = 2
+    LENS_WIRE = 3411
 
     OBJECT_DETECTORS = {
         'yolov3'       : LensYOLOv3,
@@ -421,32 +446,29 @@ class LensTasking:
         # TODO: validate keys retrieving lens tasking dictionary setups (detectors/trackers)
         dtype = np.dtype('uint8')
         shape = (camsize[1], camsize[0], 3)
-        #spyGlassContext = multiprocessing.get_context("spawn")
-        self._signal = multiprocessing.Event()
-        self._ready = multiprocessing.Event()
-        self._control, self._worker = multiprocessing.Pipe()
         self._frameBuffer = sharedctypes.RawArray('c', shape[0]*shape[1]*shape[2])
+        self._wire = LensWire(LensTasking.LENS_WIRE)
         self.process = multiprocessing.Process(target=self._taskLoop, args=(
-            self._signal, self._ready, self._control, self._frameBuffer, dtype, shape, cfg))
+            self._frameBuffer, dtype, shape, cfg))
         self.process.start()
+        self._wire.send("startup")  # initial handshake to prime the pump
         self._sharedFrame = np.frombuffer(self._frameBuffer, dtype=dtype).reshape(shape)
     
-    def _taskLoop(self, signal, ready, control, framebuff, dtype, shape, cfg):
+    def _taskLoop(self, framebuff, dtype, shape, cfg):
         try:
             frame = np.frombuffer(framebuff, dtype=dtype).reshape(shape)
+            outpost = imagezmq.ImageHub(f"tcp://127.0.0.1:{LensTasking.LENS_WIRE}")
             detect = cfg["detectobjects"]
             od = LensTasking.lens_factory(detect, cfg[detect])
             mt = cv2.MultiTracker_create()
             exceptionCount = 0
             print("LensTasking ready.")
             
-            while exceptionCount < LensTasking.FAIL_LIMIT:
-
+            while exceptionCount < LensTasking.FAIL_LIMIT: 
+ 
                 result = ([],[])  # task result is a tuple with a list of rectangles and a list of labels
-                try:
-                    signal.wait()
-                    lens = control.recv()
-
+                try: 
+                    lens = outpost.zmq_socket.recv_string()
                     if lens == "detect":
                         (rects, labels) = od.detect(frame)
                         # populate a new multi-tracker with objects found, if any
@@ -465,18 +487,16 @@ class LensTasking:
                             (x, y, w, h) = [int(v) for v in box]
                             rects.append((x, y, x+w, y+h))
                         result = (rects, [])
-
+                    
                 except (KeyboardInterrupt, SystemExit):
                     print("LensTasking shutdown.")
                     exceptionCount = LensTasking.FAIL_LIMIT  # allow shutdown to continue
                 except Exception as ex:
                     exceptionCount += 1
-                    print(f"LensTasking failure #{exceptionCount+1}.")
+                    print(f"LensTasking failure #{exceptionCount}.")
                     traceback.print_exc()
                 finally:
-                    signal.clear()
-                    control.send(result)
-                    ready.set()
+                    outpost.zmq_socket.send_pyobj(result)
 
         except (KeyboardInterrupt, SystemExit):
             print("LensTasking ending.")
@@ -485,32 +505,22 @@ class LensTasking:
             traceback.print_exc()
         finally:
             print(f"LensTasking ended with exceptionCount={exceptionCount}.")
+            outpost.close()
 
     def apply_lens(self, lens, frame) -> None:
-        np.copyto(self._sharedFrame, frame)
-        self._worker.send(lens)
-        self._signal.set()
-    
-    # is work still in progress?
-    def is_busy(self) -> bool:
-        return self._signal.is_set()
+        self._sharedFrame[:] = frame[:]  # np.copyto(self._sharedFrame, frame)
+        self._wire.send(lens)
 
-    # are results available?
     def is_ready(self) -> bool:
-        return self._ready.is_set()
-
+        return self._wire.ready()
+    
     def get_result(self) -> tuple:
-        lensresult = self._worker.recv()
-        self._ready.clear()
-        return lensresult
+        return self._wire.recv()
     
     def terminate(self) -> None:
         if self.process.is_alive():
             self.process.kill()
             self.process.join()
-
-    def __del__(self) -> None:
-        self.terminate()
 
 class Target:
 	def __init__(self, objid, classname, label ) -> None:
@@ -520,7 +530,7 @@ class Target:
 		self.classname = classname
 		self.source = 'lens'
 		self.text = label
-		self.color = tuple(np.random.randint(256, size=3))  # cannot pass to OpenCV.rectangle() like this :-/
+		#self.color = tuple(np.random.randint(256, size=3))  # cannot pass to OpenCV.rectangle() like this :-/
 	def update_geo(self, rect, cent, source, wen) -> None:
 		self.rect = rect 
 		self.cent = cent 
@@ -592,11 +602,8 @@ class SpyGlass:
         self.eventID = None
         self.state = "inactive"
         self.lastUpdate = datetime.utcnow()
-
-    def lens_busy(self) -> bool:
-        return self._tasking.is_busy()
     
-    def has_data(self) -> bool:
+    def has_result(self) -> bool:
         return self._tasking.is_ready()
     
     def get_data(self) -> tuple:
@@ -632,5 +639,5 @@ class SpyGlass:
     def terminate(self):
         self._tasking.terminate()
 
-    def __del__(self) -> None:
-        self.terminate()
+    #def __del__(self) -> None:
+    #    self.terminate()
