@@ -14,6 +14,7 @@ import uuid
 import sys
 import zmq
 import imagezmq
+import numpy as np
 import simplejpeg
 from ast import literal_eval
 from datetime import datetime
@@ -24,7 +25,7 @@ from sentinelcam.spyglass import SpyGlass, CentroidTracker
 class Outpost:
     """ SentinelCam outpost functionality wrapped up as a Detector for the
     imagenode. Employs vision analysis to provide object detection and tracking 
-    data with real-time event logging, and published image capture over ZMQ.
+    data with real-time event logging, and published image capture over imageZMQ.
 
     Parameters:
         detector (object): reference to the ImageNode Detector instance 
@@ -47,11 +48,11 @@ class Outpost:
         self._rate = FPS()
         self.ct = CentroidTracker(maxDisappeared=50, maxDistance=100)  # TODO: add parms to config
         self.sg = SpyGlass(self.dimensions, self.cfg)
-        self.motionRect = None
         self.lenstype = "motion"
+        self.motionRect = None
         self.event_start = datetime.utcnow()
-        self._tick = 0
         self._looks = 0
+        self._tick = 0
         # when configured, start at most one instance each of log and video publishing
         if self.publish_log:
             if not Outpost.logger:
@@ -186,12 +187,16 @@ class Outpost:
                         target.update_geo(rect, centroid, self.lenstype, self.sg.lastUpdate)
                         logging.debug(f"update_geo:{target.toJSON()}")
                                 
-                    # drop vanished objects from SpyGlass 
                     for target in self.sg.get_targets():
+                        # drop vanished objects from SpyGlass 
                         if target.objectID not in self.ct.objects.keys():
-                            self.sg.drop_target(target.objectID)       
                             logging.debug(f"dropped Target {target.objectID}")
-                    
+                            self.sg.drop_target(target.objectID)
+                        # keep it simple for now, only track desired object classes
+                        if target.classname != "person":
+                            logging.warning(f"dropping unexpected [{target.classname}], objectID {target.objectID}")
+                            self.sg.drop_target(target.objectID)
+
                     targets = self.sg.get_count()
                     if targets > 0:
                         # SpyGlass has objects in view, discard motion rectangle ?
@@ -233,6 +238,7 @@ class Outpost:
         if self._tick % self.skip_frames == 0:
             # tracking threshold encountered? run detection again
             if self.lenstype == "track":
+                logging.debug(f"tracking threshold reached, tick {self._tick}, look {self._looks}")
                 self.lenstype = "detect"
 
         stayalive = True   # assume there is still work to do

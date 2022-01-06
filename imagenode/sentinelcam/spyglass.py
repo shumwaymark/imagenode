@@ -397,8 +397,8 @@ class CentroidTracker:
 		return self.objects
 
 class LensWire:
-    def __init__(self, port) -> None:
-        self._wire = imagezmq.ImageSender(f"tcp://127.0.0.1:{port}")
+    def __init__(self, ipcname) -> None:
+        self._wire = imagezmq.ImageHub(f"ipc://{ipcname}")
         self._poller = zmq.Poller()
         self._poller.register(self._wire.zmq_socket, zmq.POLLIN)
 
@@ -421,7 +421,7 @@ class LensWire:
 class LensTasking:
 
     FAIL_LIMIT = 2
-    LENS_WIRE = 3411
+    LENS_WIRE = "/tmp/SpyGlass306"
 
     OBJECT_DETECTORS = {
         'yolov3'       : LensYOLOv3,
@@ -451,23 +451,26 @@ class LensTasking:
         self.process = multiprocessing.Process(target=self._taskLoop, args=(
             self._frameBuffer, dtype, shape, cfg))
         self.process.start()
-        self._wire.send("startup")  # initial handshake to prime the pump
+        handshake = self._wire._wire.zmq_socket.recv_string()  # wait on handshake from subprocess
         self._sharedFrame = np.frombuffer(self._frameBuffer, dtype=dtype).reshape(shape)
+        self._wire.send(handshake)  # prime the pmup
     
     def _taskLoop(self, framebuff, dtype, shape, cfg):
         try:
+            exceptionCount = 0
             frame = np.frombuffer(framebuff, dtype=dtype).reshape(shape)
-            outpost = imagezmq.ImageHub(f"tcp://127.0.0.1:{LensTasking.LENS_WIRE}")
+            outpost = imagezmq.ImageSender(f"ipc://{LensTasking.LENS_WIRE}")
+            outpost.zmq_socket.send_string("motion")  # handshake
             detect = cfg["detectobjects"]
             od = LensTasking.lens_factory(detect, cfg[detect])
             mt = cv2.MultiTracker_create()
-            exceptionCount = 0
-            print("LensTasking ready.")
+            print("LensTasking started.")
             
             while exceptionCount < LensTasking.FAIL_LIMIT: 
  
                 result = ([],[])  # task result is a tuple with a list of rectangles and a list of labels
                 try: 
+                    # wait on a lens command from the Outpost
                     lens = outpost.zmq_socket.recv_string()
                     if lens == "detect":
                         (rects, labels) = od.detect(frame)
@@ -496,6 +499,7 @@ class LensTasking:
                     print(f"LensTasking failure #{exceptionCount}.")
                     traceback.print_exc()
                 finally:
+                    # always reply to the Outpost
                     outpost.zmq_socket.send_pyobj(result)
 
         except (KeyboardInterrupt, SystemExit):
@@ -582,10 +586,18 @@ class SpyGlass:
 
     Methods
     -------
+    has_result() -> bool
+        spyglass has results avalable
+    get_data() - > tuple
+        retrieve results from spyglass
+    apply_lens(type, frame) -> None
+        send frame to spyglass for analysis, with lens type to use
     new_target(objid, rect, classname, label) -> Target
         create a new trackable target
 	get_target(objid) -> Target
 		return spyglass target by object ID
+    drop_target(objid) -> None
+        delete a tracked object by object ID
     update_target_geo(objid, rect, cent, source, datetime) -> None
         update the tracking coordinates for a target by ID, with source of data
     get_count() -> int
@@ -593,7 +605,9 @@ class SpyGlass:
 	get_targets() -> list
 		return list of targets being tracked
     detect_motion(image) -> list
-        return rectangles for areas of motion within image from backgroumd subtraction
+        return a rectangle for aggregate area of motion from background subtraction model
+    terminate() -> None
+        kill the LensTasking subprocess, be nice and call this as a part of imagenode shutdown
     """
     def __init__(self, camsize, cfg) -> None:
         self._tasking = LensTasking(camsize, cfg)
