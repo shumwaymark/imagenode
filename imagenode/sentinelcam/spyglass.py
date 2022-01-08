@@ -11,6 +11,7 @@ License: MIT, see the sentinelcam LICENSE for more details.
 import os
 import json
 import traceback
+import uuid
 import cv2
 import imutils
 import imagezmq
@@ -401,6 +402,9 @@ class LensWire:
         self._wire = imagezmq.ImageHub(f"ipc://{ipcname}")
         self._poller = zmq.Poller()
         self._poller.register(self._wire.zmq_socket, zmq.POLLIN)
+        self.recv_handshake = self._wire.zmq_socket.recv_string
+        self._recv = self._wire.zmq_socket.recv_pyobj
+        self._send = self._wire.zmq_socket.send_string
 
     def ready(self) -> bool:
         events = dict(self._poller.poll(0))
@@ -410,10 +414,10 @@ class LensWire:
             return False
     
     def send(self, lenstype) -> None:
-        self._wire.zmq_socket.send_string(lenstype)
+        self._send(lenstype)
     
     def recv(self) -> tuple:
-        return self._wire.zmq_socket.recv_pyobj()
+        return self._recv()
 
     def __del__(self) -> None:
         self._wire.close()
@@ -451,7 +455,7 @@ class LensTasking:
         self.process = multiprocessing.Process(target=self._taskLoop, args=(
             self._frameBuffer, dtype, shape, cfg))
         self.process.start()
-        handshake = self._wire._wire.zmq_socket.recv_string()  # wait on handshake from subprocess
+        handshake = self._wire.recv_handshake()  # wait on handshake from subprocess
         self._sharedFrame = np.frombuffer(self._frameBuffer, dtype=dtype).reshape(shape)
         self._wire.send(handshake)  # prime the pmup
     
@@ -461,6 +465,8 @@ class LensTasking:
             frame = np.frombuffer(framebuff, dtype=dtype).reshape(shape)
             outpost = imagezmq.ImageSender(f"ipc://{LensTasking.LENS_WIRE}")
             outpost.zmq_socket.send_string("motion")  # handshake
+            outpost_send = outpost.zmq_socket.send_pyobj
+            outpost_recv = outpost.zmq_socket.recv_string
             detect = cfg["detectobjects"]
             od = LensTasking.lens_factory(detect, cfg[detect])
             mt = cv2.MultiTracker_create()
@@ -468,10 +474,11 @@ class LensTasking:
             
             while exceptionCount < LensTasking.FAIL_LIMIT: 
  
-                result = ([],[])  # task result is a tuple with a list of rectangles and a list of labels
+                # task result is a tuple with a list of rectangles and a list of labels
+                result = ([], None)
                 try: 
                     # wait on a lens command from the Outpost
-                    lens = outpost.zmq_socket.recv_string()
+                    lens = outpost_recv()
                     if lens == "detect":
                         (rects, labels) = od.detect(frame)
                         # populate a new multi-tracker with objects found, if any
@@ -489,7 +496,7 @@ class LensTasking:
                         for box in boxes:
                             (x, y, w, h) = [int(v) for v in box]
                             rects.append((x, y, x+w, y+h))
-                        result = (rects, [])
+                        result = (rects, None)
                     
                 except (KeyboardInterrupt, SystemExit):
                     print("LensTasking shutdown.")
@@ -500,7 +507,7 @@ class LensTasking:
                     traceback.print_exc()
                 finally:
                     # always reply to the Outpost
-                    outpost.zmq_socket.send_pyobj(result)
+                    outpost_send(result)
 
         except (KeyboardInterrupt, SystemExit):
             print("LensTasking ending.")
@@ -550,6 +557,11 @@ class Target:
 			'tag': self.text,
 			'upd': self.upd.isoformat()
 		})
+	def toTrk(self) -> dict:
+		return {'obj': self.objectID,
+                'clas': self.classname,
+                'rect': (int(self.rect[0]),int(self.rect[1]),int(self.rect[2]),int(self.rect[3]))
+        }
 
 class SpyGlass:
     """ The SpyGlass is a construct conceieved as an event and state
@@ -560,7 +572,7 @@ class SpyGlass:
     the below has been implemented. Parts of this should be delegated to 
     batch processing by the Sentinel.
 
-    - state (active/inactive/quiet/changing)
+    - state/status (active/inactive/quiet/changing)
     - timestamp of last actitivy
     - current or last event id
     - current lens (detect/track)
@@ -578,11 +590,18 @@ class SpyGlass:
         - color (for drawing rectangles on images)
     
     SpyGlass methods are primarly wrappers for LensTasking along with 
-    convenience access to the list of Targets
+    convenience access to the list of Targets.
+
+    Internal use only, one instance per Outpost view.
 
     Parameters
     ----------
-    Not applicable. Internal use only, one instance per Outpost view.
+    view : str  
+        imagenode camera view name
+    camsize : tuple
+        image size (width, height) tuple
+    cfg : dict
+        configuration dictionary for LensTasking
 
     Methods
     -------
@@ -590,7 +609,7 @@ class SpyGlass:
         spyglass has results avalable
     get_data() - > tuple
         retrieve results from spyglass
-    apply_lens(type, frame) -> None
+    apply_lens(lenstype, frame) -> None
         send frame to spyglass for analysis, with lens type to use
     new_target(objid, rect, classname, label) -> Target
         create a new trackable target
@@ -609,12 +628,14 @@ class SpyGlass:
     terminate() -> None
         kill the LensTasking subprocess, be nice and call this as a part of imagenode shutdown
     """
-    def __init__(self, camsize, cfg) -> None:
+    def __init__(self, view, camsize, cfg) -> None:
         self._tasking = LensTasking(camsize, cfg)
         self._motion = LensMotion()
-        self._targets = {}
+        self._targets = {}  # dictionary of Targets by objectID
+        self._logdata = {}  # tracking event data for logging
         self.eventID = None
-        self.state = "inactive"
+        self.status = "inactive"
+        self.view = view
         self.lastUpdate = datetime.utcnow()
     
     def has_result(self) -> bool:
@@ -652,6 +673,16 @@ class SpyGlass:
 
     def terminate(self):
         self._tasking.terminate()
+
+    def new_event(self) -> dict:
+        self.eventID = uuid.uuid1().hex
+        self.event_start = datetime.utcnow()
+        self._logdata = {'id': self.eventID, 'view': self.view, 'evt': 'start'}
+        return self._logdata
+
+    def trackingLog(self) -> dict:
+        self._logdata = {'id': self.eventID, 'view': self.view, 'evt': 'trk'}
+        return self._logdata
 
     #def __del__(self) -> None:
     #    self.terminate()
