@@ -402,9 +402,9 @@ class LensWire:
         self._wire = imagezmq.ImageHub(f"ipc://{ipcname}")
         self._poller = zmq.Poller()
         self._poller.register(self._wire.zmq_socket, zmq.POLLIN)
-        self.recv_handshake = self._wire.zmq_socket.recv_string
+        self._send = self._wire.zmq_socket.send
         self._recv = self._wire.zmq_socket.recv_pyobj
-        self._send = self._wire.zmq_socket.send_string
+        self.recv_handshake = self._wire.zmq_socket.recv
 
     def ready(self) -> bool:
         events = dict(self._poller.poll(0))
@@ -414,7 +414,7 @@ class LensWire:
             return False
     
     def send(self, lenstype) -> None:
-        self._send(lenstype)
+        self._send(str(lenstype).encode('ascii'))
     
     def recv(self) -> tuple:
         return self._recv()
@@ -426,6 +426,9 @@ class LensTasking:
 
     FAIL_LIMIT = 2
     LENS_WIRE = "/tmp/SpyGlass306"
+
+    Request_DETECT = 1
+    Request_TRACK = 2
 
     OBJECT_DETECTORS = {
         'yolov3'       : LensYOLOv3,
@@ -464,22 +467,22 @@ class LensTasking:
             exceptionCount = 0
             frame = np.frombuffer(framebuff, dtype=dtype).reshape(shape)
             outpost = imagezmq.ImageSender(f"ipc://{LensTasking.LENS_WIRE}")
-            outpost.zmq_socket.send_string("motion")  # handshake
+            outpost.zmq_socket.send('0'.encode('ascii'))  # handshake
             outpost_send = outpost.zmq_socket.send_pyobj
-            outpost_recv = outpost.zmq_socket.recv_string
+            outpost_recv = outpost.zmq_socket.recv
             detect = cfg["detectobjects"]
             od = LensTasking.lens_factory(detect, cfg[detect])
             mt = cv2.MultiTracker_create()
             print("LensTasking started.")
-            
+                        
             while exceptionCount < LensTasking.FAIL_LIMIT: 
  
                 # task result is a tuple with a list of rectangles and a list of labels
                 result = ([], None)
                 try: 
                     # wait on a lens command from the Outpost
-                    lens = outpost_recv()
-                    if lens == "detect":
+                    lens = int(outpost_recv())
+                    if lens == LensTasking.Request_DETECT:
                         (rects, labels) = od.detect(frame)
                         # populate a new multi-tracker with objects found, if any
                         mt = cv2.MultiTracker_create()
@@ -488,7 +491,7 @@ class LensTasking:
                             mt.add(tracker, frame, (x1, y1, x2-x1, y2-y1))
                         result = (rects, labels)
                 
-                    elif lens == "track":
+                    elif lens == LensTasking.Request_TRACK:
                         # update object trackers
                         (success, boxes) = mt.update(frame)
                         # loop over the bounding boxes and convert to an (x1, y1, x2, y2) list
@@ -625,6 +628,10 @@ class SpyGlass:
 		return list of targets being tracked
     detect_motion(image) -> list
         return a rectangle for aggregate area of motion from background subtraction model
+    new_event() -> dict
+        indicate start of new event and return dictionary with logging information
+    trackingLog(type) -> dict
+        return current event logging record dictionary for specifed type ['trk','end']
     terminate() -> None
         kill the LensTasking subprocess, be nice and call this as a part of imagenode shutdown
     """
@@ -634,7 +641,6 @@ class SpyGlass:
         self._targets = {}  # dictionary of Targets by objectID
         self._logdata = {}  # tracking event data for logging
         self.eventID = None
-        self.status = "inactive"
         self.view = view
         self.lastUpdate = datetime.utcnow()
     
@@ -671,18 +677,18 @@ class SpyGlass:
     def detect_motion(self, image) -> tuple:
         return self._motion.detect(image)
 
-    def terminate(self):
-        self._tasking.terminate()
-
     def new_event(self) -> dict:
         self.eventID = uuid.uuid1().hex
         self.event_start = datetime.utcnow()
         self._logdata = {'id': self.eventID, 'view': self.view, 'evt': 'start'}
         return self._logdata
 
-    def trackingLog(self) -> dict:
-        self._logdata = {'id': self.eventID, 'view': self.view, 'evt': 'trk'}
+    def trackingLog(self, evt) -> dict:
+        self._logdata = {'id': self.eventID, 'view': self.view, 'evt': evt}
         return self._logdata
+
+    def terminate(self):
+        self._tasking.terminate()
 
     #def __del__(self) -> None:
     #    self.terminate()
