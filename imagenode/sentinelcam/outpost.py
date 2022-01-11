@@ -47,8 +47,9 @@ class Outpost:
     Lens_DETECT = 1
     Lens_TRACK = 2
     Lens_REDETECT = 3
+    Lens_RESET = 4
 
-    Lens = ["Motion","Detect","Track","ReDetect"]
+    Lens = ["Motion","Detect","Track","ReDetect","Reset"]
 
     def __init__(self, detector, config, nodename, viewname):
         self.nodename = nodename
@@ -197,9 +198,14 @@ class Outpost:
                     self.sg.lastUpdate = datetime.utcnow()
                     self.lenstype = Outpost.Lens_TRACK
 
-                    # run detection again if required
+                    # If requested, clear results and apply a new lens.
                     if self.state == Outpost.Lens_REDETECT:
                         self.lenstype = Outpost.Lens_DETECT
+                        rects = []
+                    elif self.state == Outpost.Lens_RESET:
+                        # This is effectively a NOOP for the SpyGlass. A lens command = 0 
+                        # insures that the next result set will be empty. 
+                        self.lenstype = Outpost.Lens_MOTION 
                         rects = []
 
                 else:
@@ -232,7 +238,8 @@ class Outpost:
                 logging.debug(f"sending '{self.lenstype}' to LensTasking, tick {self._tick}, look {self._looks}")
                 self.sg.apply_lens(self.lenstype, image)
 
-                # Now work through current SpyGlass result set, if any 
+                # With current frame sent to the SpyGlass for analysis, there is now 
+                # time to work through the result set from the prior request, if any.
                 if len(rects) > 0:
                     # Centroid tracking algorithm courtesy of PyImageSearch.
                     # Using this to map tracked object centroids back to a  
@@ -258,6 +265,7 @@ class Outpost:
                             if labels is None:
                                 logging.debug(f"How did we get here with obj {objectID}?")
                                 labels=[]
+                            #classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
                             if i<len(labels):
                                 #logging.debug(f"apply label, tick {self._tick} look {self._looks} i {i} label {labels[i]} obj {objectID} cent {centroid}")
                                 classname = labels[i].split(' ')[0][:-1]
@@ -266,7 +274,6 @@ class Outpost:
                                 for j, label in enumerate(labels):
                                     logging.debug(f"labels[{j}]='{label}'" )
                                 classname = 'mystery'
-                            #classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
                             targetText = "_".join([classname, str(objectID)])
                             target = self.sg.new_target(objectID, classname, targetText)
 
@@ -281,7 +288,7 @@ class Outpost:
                             self.sg.drop_target(target.objectID)
                         # Keep it simple for now, only track desired object classes?
                         if target.classname != "person":
-                            logging.warning(f"dropping unexpected [{target.classname}] obj {target.objectID} state {self.state} tick {self._tick} look {self._looks}")
+                            logging.warning(f"Dropped [{target.classname}] obj {target.objectID} state {self.state} next {self.lenstype} tick {self._tick} look {self._looks}")
                             self.sg.drop_target(target.objectID)
                             # CentroidTracker still has this, ignore it for the 
                             # remainder of the event. This is admitedly, a bit clumsy.
@@ -320,7 +327,6 @@ class Outpost:
                     # assume this was a false alarm, and resume motion detection
                     logging.debug(f"revert to motion, tick {self._tick}, look {self._looks}")
                     self.lenstype = Outpost.Lens_MOTION
-                    self.state = Outpost.Lens_MOTION
             else:
                 # SpyGlass ia busy. Skip this cycle and keep going. 
                 pass
@@ -365,24 +371,22 @@ class Outpost:
 
             if not stayalive:
                 logging.info(f"ote{json.dumps(self.sg.trackingLog('end'))}")
+                # Ultimately, need more smarts around this. For now though,
+                # this is quick, easy, and painless. Just erase the SpyGlass
+                # memory and reset for a fresh start.
                 for target in self.sg.get_targets():
                     self.sg.drop_target(target.objectID)   
-                # Also, wipe the memory of the CentroidTracker
+                # Also, wipe the memory of the CentroidTracker.
                 trkdObjs = list(self.ct.objects.keys())
                 for o in trkdObjs:
                     self.ct.deregister(o)
                 self.dropList = {}
-                self.lenstype = Outpost.Lens_MOTION
+                self.lenstype = Outpost.Lens_RESET
                 self.status = Outpost.Status_INACTIVE
 
         if self.state != self.lenstype:
             logging.debug(f"State change from {self.lenstype} to {self.state}")
             self.state = self.lenstype
-        if targets == 0:
-            if motionRect:
-                # Have motion but no object yet detected. Perhaps 
-                # this should be logged for review and analysis?
-                pass        
 
     def setups(self, config) -> None:
         if 'camwatcher' in config:
