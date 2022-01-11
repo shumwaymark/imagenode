@@ -12,7 +12,6 @@ import json
 import socket
 import sys
 import time
-from numpy.core.numeric import outer
 import zmq
 import imagezmq
 import numpy as np
@@ -145,7 +144,7 @@ class Outpost:
                     logging.info(f"fps{self._rate.fps():.2f} at tick {self._tick}")
                     self._heartbeat = mm
 
-        rects = []                     # always start fresh, no determinations made
+        rects = []                     # fresh start here, no determinations made
         targets = self.sg.get_count()  # number of ojects tracked by the SpyGlass
 
         # Always run the motion detector. It's fast and the information 
@@ -201,6 +200,7 @@ class Outpost:
                     # run detection again if required
                     if self.state == Outpost.Lens_REDETECT:
                         self.lenstype = Outpost.Lens_DETECT
+                        rects = []
 
                 else:
                     # Based on the Outlook <-> SpyGlass protocol, this could be an
@@ -256,9 +256,17 @@ class Outpost:
                         # occur during tracking, since only detection produces new objects. 
                         if target is None:
                             if labels is None:
-                                logging.debug("How did we get here?")
+                                logging.debug(f"How did we get here with obj {objectID}?")
                                 labels=[]
-                            classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
+                            if i<len(labels):
+                                #logging.debug(f"apply label, tick {self._tick} look {self._looks} i {i} label {labels[i]} obj {objectID} cent {centroid}")
+                                classname = labels[i].split(' ')[0][:-1]
+                            else:
+                                logging.debug(f"label count is {len(labels)}")
+                                for j, label in enumerate(labels):
+                                    logging.debug(f"labels[{j}]='{label}'" )
+                                classname = 'mystery'
+                            #classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
                             targetText = "_".join([classname, str(objectID)])
                             target = self.sg.new_target(objectID, classname, targetText)
 
@@ -273,7 +281,7 @@ class Outpost:
                             self.sg.drop_target(target.objectID)
                         # Keep it simple for now, only track desired object classes?
                         if target.classname != "person":
-                            logging.warning(f"dropping unexpected [{target.classname}], objectID {target.objectID}")
+                            logging.warning(f"dropping unexpected [{target.classname}] obj {target.objectID} state {self.state} tick {self._tick} look {self._looks}")
                             self.sg.drop_target(target.objectID)
                             # CentroidTracker still has this, ignore it for the 
                             # remainder of the event. This is admitedly, a bit clumsy.
@@ -285,7 +293,7 @@ class Outpost:
                         # Finished processing results, and came up empty. Detection should run
                         # again by default. Note the forced change in state for the next pass.
                         self.lenstype = Outpost.Lens_REDETECT
-                        # Also, wipe the memory of the CentroidTracker
+                        # Also wipe the memory of the CentroidTracker, just to be certain.
                         trkdObjs = list(self.ct.objects.keys())
                         for o in trkdObjs:
                             self.ct.deregister(o)
@@ -301,6 +309,7 @@ class Outpost:
                         if self.status == Outpost.Status_ACTIVE:
                             # event in progress
                             ote = self.sg.trackingLog('trk')
+                            ote['state'] = self.state  # just curious, can see when camwatcher logging=DEBUG
                             for target in self.sg.get_targets():
                                 if target.upd == self.sg.lastUpdate:
                                     ote.update(target.toTrk())
@@ -313,13 +322,16 @@ class Outpost:
                     self.lenstype = Outpost.Lens_MOTION
                     self.state = Outpost.Lens_MOTION
             else:
-                # SpyGlass ia busy. Skip this cycle and resume without further analysis. 
+                # SpyGlass ia busy. Skip this cycle and keep going. 
                 pass
 
         # outpost tick count 
         self._tick += 1  
         if self._tick % 100 == 0:  # self.skip_frames == 0:
-            # tracking threshold encountered? run detection again
+            # Tracking threshold encountered? Run detection again. Should perhaps measure this 
+            # based on both the number of successful tracking calls, as well as an elapsed time 
+            # threshold. It might make sense to formulate based on the tick count if there is
+            # an efficient way to gather metrics in-flight.
             if self.lenstype == Outpost.Lens_TRACK:
                 logging.debug(f"tracking threshold reached, tick {self._tick}, look {self._looks}")
                 self.lenstype = Outpost.Lens_DETECT
@@ -333,12 +345,13 @@ class Outpost:
                 stayalive = False
                 logging.debug(f"Ending active event {self.sg.eventID}")
             elif self._noMotion > 5:
-                # Right now at least. This is mostly because the CentroidTracker 
-                # is currently hanging on to objects longer than necessary
+                # This is more bandaid than correct. Mostly because the 
+                # CentroidTracker is currently hanging on to objects longer 
+                # than necessary
                 self.status = Outpost.Status_QUIET
             else:
-                # fail safe kill switch, forced shutdown after 15 seconds 
-                # TODO: design flexibility for this via ruleset in configuration?
+                # Fail safe kill switch, forced shutdown after 15 seconds. 
+                # TODO: Design flexibility for this via ruleset in configuration?
                 #  ----------------------------------------------------------
                 event_elapsed = datetime.utcnow() - self.event_start
                 if event_elapsed.seconds > 15:
@@ -351,8 +364,7 @@ class Outpost:
                 stayalive = False
 
             if not stayalive:
-                ote = self.sg.trackingLog('end')
-                logging.info(f"ote{json.dumps(ote)}")
+                logging.info(f"ote{json.dumps(self.sg.trackingLog('end'))}")
                 for target in self.sg.get_targets():
                     self.sg.drop_target(target.objectID)   
                 # Also, wipe the memory of the CentroidTracker

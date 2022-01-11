@@ -16,6 +16,7 @@ import cv2
 import imutils
 import imagezmq
 import numpy as np
+import msgpack
 import multiprocessing
 from multiprocessing import sharedctypes
 from datetime import datetime
@@ -232,6 +233,7 @@ class LensMobileNetSSD:
                 box = detections[0, 0, i, 3:7] * np.array(
                     [self.W, self.H, self.W, self.H])
                 objs.append(box.astype("int"))
+                #objs.append((int(box[0]),int(box[1]),int(box[2]),int(box[3])))
                 labls.append("{}: {:.4f}".format(
                     self.CLASSES[idx],
 					confidence))
@@ -460,31 +462,33 @@ class LensTasking:
         self.process.start()
         handshake = self._wire.recv_handshake()  # wait on handshake from subprocess
         self._sharedFrame = np.frombuffer(self._frameBuffer, dtype=dtype).reshape(shape)
-        self._wire.send(handshake)  # prime the pmup
+        self._wire.send(handshake)  # send it right back to prime the pmup
     
     def _taskLoop(self, framebuff, dtype, shape, cfg):
         try:
             exceptionCount = 0
             frame = np.frombuffer(framebuff, dtype=dtype).reshape(shape)
             outpost = imagezmq.ImageSender(f"ipc://{LensTasking.LENS_WIRE}")
-            outpost.zmq_socket.send('0'.encode('ascii'))  # handshake
+            outpost.zmq_socket.send(str(0).encode('ascii'))  # handshake
             outpost_send = outpost.zmq_socket.send_pyobj
             outpost_recv = outpost.zmq_socket.recv
             detect = cfg["detectobjects"]
             od = LensTasking.lens_factory(detect, cfg[detect])
             mt = cv2.MultiTracker_create()
             print("LensTasking started.")
-                        
-            while exceptionCount < LensTasking.FAIL_LIMIT: 
+            
+            # Ignoring the first exception, just for a little dev sanity. See syslog for exceptions.
+            while exceptionCount < LensTasking.FAIL_LIMIT:  
  
-                # task result is a tuple with a list of rectangles and a list of labels
+                # Task result is a tuple with a list of rectangles and a list of labels
                 result = ([], None)
                 try: 
                     # wait on a lens command from the Outpost
                     lens = int(outpost_recv())
                     if lens == LensTasking.Request_DETECT:
+                        # Run object detection 
                         (rects, labels) = od.detect(frame)
-                        # populate a new multi-tracker with objects found, if any
+                        # Populate a new multi-tracker with objects found, if any
                         mt = cv2.MultiTracker_create()
                         for (x1, y1, x2, y2) in rects:
                             tracker = LensTasking.OPENCV_OBJECT_TRACKERS[cfg["tracker"]]()
@@ -492,9 +496,9 @@ class LensTasking:
                         result = (rects, labels)
                 
                     elif lens == LensTasking.Request_TRACK:
-                        # update object trackers
+                        # Update object trackers
                         (success, boxes) = mt.update(frame)
-                        # loop over the bounding boxes and convert to an (x1, y1, x2, y2) list
+                        # Loop over the bounding boxes and convert to an (x1, y1, x2, y2) list
                         rects = []
                         for box in boxes:
                             (x, y, w, h) = [int(v) for v in box]
@@ -633,7 +637,7 @@ class SpyGlass:
     trackingLog(type) -> dict
         return current event logging record dictionary for specifed type ['trk','end']
     terminate() -> None
-        kill the LensTasking subprocess, be nice and call this as a part of imagenode shutdown
+        kill the LensTasking subprocess. Be courteous and call this as a part of imagenode shutdown
     """
     def __init__(self, view, camsize, cfg) -> None:
         self._tasking = LensTasking(camsize, cfg)
