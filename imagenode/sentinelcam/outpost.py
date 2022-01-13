@@ -119,8 +119,8 @@ class Outpost:
         Parameters:
             camera (Camera object): current camera
             image (OpenCV image): current image
-            send_q (Deque): where (text, image) tuples can be appended for
-                            sending to the imagehub for Librarian processing
+            send_q (Deque): where (text, image) tuples can be passed
+                            to the imagehub for Librarian processing
 
         """
         if self.publish_cam:
@@ -148,7 +148,7 @@ class Outpost:
         rects = []                     # fresh start here, no determinations made
         targets = self.sg.get_count()  # number of ojects tracked by the SpyGlass
 
-        # Always run the motion detector. It's fast and the information 
+        # Always apply the motion detector. It's fast and the information 
         # is generally useful. Apply background subtraction model within
         # region of interest only.
         x1, y1 = self.detector.top_left
@@ -167,7 +167,7 @@ class Outpost:
                 # the setup for cfg["detectobject"] == 'motion'
                 # With an aggregate area of motion in play, there would be no
                 # need for the CentroidTracker. Just report the motion rectangle
-                # as the the event data.
+                # as the event data.
                 self._looks += 1
                 self.lenstype = Outpost.Lens_DETECT
 
@@ -201,18 +201,18 @@ class Outpost:
                     # If requested, clear results and apply a new lens.
                     if self.state == Outpost.Lens_REDETECT:
                         self.lenstype = Outpost.Lens_DETECT
-                        rects = []
+                        rects = []  
                     elif self.state == Outpost.Lens_RESET:
-                        # This is effectively a NOOP for the SpyGlass. A lens command = 0 
-                        # insures that the next result set will be empty. 
+                        # This is effectively a NOOP for the SpyGlass. 
+                        # A lens command = 0 insures that the next result set will be empty. 
                         self.lenstype = Outpost.Lens_MOTION 
                         rects = []
 
                 else:
-                    # Based on the Outlook <-> SpyGlass protocol, this could be an
-                    # old, now very stale, empty result set just received. In which 
-                    # case, it's meaningless. So look again. On the other hand, this 
-                    # could just as easily represent an end to the current event.
+                    # Based on the Outlook <-> SpyGlass protocol, any result set could 
+                    # be an old, now very stale, set just now received. In which case,
+                    # it's meaningless. So look again. On the other hand, this could 
+                    # just as easily represent an end to the current event.
                     
                     if self.state in [Outpost.Lens_MOTION, Outpost.Lens_REDETECT]:
                         self.lenstype = Outpost.Lens_DETECT  # Keep looking as long as there is motion.
@@ -267,7 +267,6 @@ class Outpost:
                                 labels=[]
                             #classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
                             if i<len(labels):
-                                #logging.debug(f"apply label, tick {self._tick} look {self._looks} i {i} label {labels[i]} obj {objectID} cent {centroid}")
                                 classname = labels[i].split(' ')[0][:-1]
                             else:
                                 logging.debug(f"label count is {len(labels)}")
@@ -277,14 +276,14 @@ class Outpost:
                             targetText = "_".join([classname, str(objectID)])
                             target = self.sg.new_target(objectID, classname, targetText)
 
-                        rect = rects[i] if i<len(rects) else (0,0,0,0)  # TODO: fix this stupid hack
+                        rect = rects[i] if i<len(rects) else (0,0,0,0)  # TODO: fix this stupid hack? - maybe not needed anymore
                         target.update_geo(rect, centroid, self.state, self.sg.lastUpdate)
                         logging.debug(f"update_geo:{target.toJSON()}")
 
                     for target in self.sg.get_targets():
                         # Drop vanished objects from SpyGlass 
                         if target.objectID not in self.ct.objects.keys():
-                            logging.debug(f"dropped Target {target.objectID}")
+                            logging.debug(f"Target {target.objectID} vanished")
                             self.sg.drop_target(target.objectID)
                         # Keep it simple for now, only track desired object classes?
                         if target.classname != "person":
@@ -333,11 +332,11 @@ class Outpost:
 
         # outpost tick count 
         self._tick += 1  
-        if self._tick % 100 == 0:  # self.skip_frames == 0:
+        if self._tick % self.skip_frames == 0:  # TODO needs a better name. Not "frames".
             # Tracking threshold encountered? Run detection again. Should perhaps measure this 
             # based on both the number of successful tracking calls, as well as an elapsed time 
             # threshold. It might make sense to formulate based on the tick count if there is
-            # an efficient way to gather metrics in-flight.
+            # an efficient way to gather metrics in-flight (something for the TODO list).
             if self.lenstype == Outpost.Lens_TRACK:
                 logging.debug(f"tracking threshold reached, tick {self._tick}, look {self._looks}")
                 self.lenstype = Outpost.Lens_DETECT
@@ -385,7 +384,7 @@ class Outpost:
                 self.status = Outpost.Status_INACTIVE
 
         if self.state != self.lenstype:
-            logging.debug(f"State change from {self.lenstype} to {self.state}")
+            logging.debug(f"State change from {self.state} to {self.lenstype}")
             self.state = self.lenstype
 
     def setups(self, config) -> None:
