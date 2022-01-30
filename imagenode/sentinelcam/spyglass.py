@@ -13,6 +13,7 @@ import json
 import traceback
 import uuid
 import cv2
+import dlib
 import imutils
 import imagezmq
 import numpy as np
@@ -82,14 +83,14 @@ class ParseYOLOOutput:
 		return (boxes, confidences, classIDs)
 
 class LensMotion:
-    def __init__(self) -> None:
-        self.mog = cv2.bgsegm.createBackgroundSubtractorMOG()
+    def __init__(self) -> None:  
+        # TODO: add threshold and history length as configuration items
+        self.mog = cv2.createBackgroundSubtractorMOG2(varThreshold=128, detectShadows=False)
     
     def detect(self, image) -> tuple:
         # apply the MOG background subtraction model
         mask = self.mog.apply(image)
-        cnts = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE)
+        cnts = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = imutils.grab_contours(cnts)
         (minX, minY) = (image.shape[1], image.shape[0])
         (maxX, maxY) = (0, 0)
@@ -100,15 +101,15 @@ class LensMotion:
 
 		# otherwise, loop over the contours
         for c in cnts:
-			# compute the bounding box of the contour and use it to
-			# update the minimum and maximum bounding box of the region
+            # compute the bounding box of the contour and use it to
+            # update the minimum and maximum bounding box of the region
             (x, y, w, h) = cv2.boundingRect(c)
-            if w>20 and h>20:  # apply a size threshold for noise suppression
+            if w>50 and h>50:  # apply a size threshold for noise suppression TODO: config item?
                 (minX, minY) = (min(minX, x), min(minY, y))
                 (maxX, maxY) = (max(maxX, x + w), max(maxY, y + h))
 
-		# return a tuple with the bounding box
-        return (minX, minY, maxX, maxY)
+        # return a tuple with the bounding box
+        return (minX, minY, maxX, maxY)   # TODO: apply configurable filter on aggregate size?
 
 class LensYOLOv3:
     def __init__(self, conf) -> None:
@@ -436,23 +437,31 @@ class LensTasking:
         'yolov3'       : LensYOLOv3,
         'mobilenetssd' : LensMobileNetSSD
     }
-    def lens_factory(lensname, cfg):
-        return LensTasking.OBJECT_DETECTORS[lensname](cfg)
+    def lens_factory(lenstype, cfg):
+        if lenstype == LensTasking.Request_DETECT:
+            detect = cfg["detectobjects"]
+            return LensTasking.OBJECT_DETECTORS[detect](cfg[detect])
 
-    # Initialize a dictionary that maps strings to their corresponding
-    # (now legacy) OpenCV contributed object tracker implementations
-    OPENCV_OBJECT_TRACKERS = {
-	    "csrt": cv2.TrackerCSRT_create,
-	    "kcf": cv2.TrackerKCF_create,
-	    "boosting": cv2.TrackerBoosting_create,
-	    "mil": cv2.TrackerMIL_create,
-	    "tld": cv2.TrackerTLD_create,
-	    "medianflow": cv2.TrackerMedianFlow_create,
-	    "mosse": cv2.TrackerMOSSE_create
-    }
+        elif lenstype == LensTasking.Request_TRACK:
+            if cfg['tracker'] == 'dlib':
+                return dlib.correlation_tracker()
+            else:
+                # This dictionary maps strings to their corresponding (now
+                # legacy) OpenCV contributed object tracker implementations
+                OPENCV_OBJECT_TRACKERS = {
+                    "csrt": cv2.TrackerCSRT_create,
+                    "kcf": cv2.TrackerKCF_create,
+                    "boosting": cv2.TrackerBoosting_create,
+                    "mil": cv2.TrackerMIL_create,
+                    "tld": cv2.TrackerTLD_create,
+                    "medianflow": cv2.TrackerMedianFlow_create,
+                    "mosse": cv2.TrackerMOSSE_create
+                }
+                return OPENCV_OBJECT_TRACKERS[cfg["tracker"]]()
 
     def __init__(self, camsize, cfg) -> None:
-        # TODO: validate keys retrieving lens tasking dictionary setups (detectors/trackers)
+        self._dlib = cfg['tracker'] == 'dlib'
+        self._trkrs = None
         dtype = np.dtype('uint8')
         shape = (camsize[1], camsize[0], 3)
         self._frameBuffer = sharedctypes.RawArray('c', shape[0]*shape[1]*shape[2])
@@ -463,7 +472,50 @@ class LensTasking:
         handshake = self._wire.recv_handshake()  # wait on handshake from subprocess
         self._sharedFrame = np.frombuffer(self._frameBuffer, dtype=dtype).reshape(shape)
         self._wire.send(handshake)  # send it right back to prime the pmup
+
+    def _trackers(self):
+        if self._dlib:
+            return []
+        else:
+            return cv2.MultiTracker_create()
     
+    def _track_this(self, trkr, frame, x1, y1, x2, y2):
+        if self._dlib:
+            # convert the frame from BGR to RGB for dlib
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rect = dlib.rectangle(x1, y1, x2, y2)
+            trkr.start_track(rgb, rect)
+            self._trkrs.append(trkr)
+        else:
+            self._trkrs.add(trkr, frame, (x1, y1, x2-x1, y2-y1))
+
+    def _update_trackers(self, frame):
+        rects = []
+        if self._dlib:
+            # convert the frame from BGR to RGB for dlib
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # loop over the trackers
+            for tracker in self._trkrs:
+                # update the tracker and grab the updated position
+                tracker.update(rgb)
+                pos = tracker.get_position()
+                # unpack the position object
+                startX = int(pos.left())
+                startY = int(pos.top())
+                endX = int(pos.right())
+                endY = int(pos.bottom())
+                # add the bounding box coordinates to the rectangles list
+                rects.append((startX, startY, endX, endY))
+        else:
+            # Update object trackers
+            (success, boxes) = self._trkrs.update(frame)
+            # Loop over the bounding boxes and convert to an (x1, y1, x2, y2) list
+            for box in boxes:
+                (x, y, w, h) = [int(v) for v in box]
+                rects.append((x, y, x+w, y+h))
+        # return results
+        return rects
+
     def _taskLoop(self, framebuff, dtype, shape, cfg):
         try:
             exceptionCount = 0
@@ -472,12 +524,12 @@ class LensTasking:
             outpost.zmq_socket.send(str(0).encode('ascii'))  # handshake
             outpost_send = outpost.zmq_socket.send_pyobj
             outpost_recv = outpost.zmq_socket.recv
-            detect = cfg["detectobjects"]
-            od = LensTasking.lens_factory(detect, cfg[detect])
-            mt = cv2.MultiTracker_create()
+            
+            od = LensTasking.lens_factory(LensTasking.Request_DETECT, cfg)
+            self._trkrs = self._trackers()
             print("LensTasking started.")
             
-            # Ignoring the first exception, just for a little dev sanity. See syslog for exceptions.
+            # Ignoring the first exception, just for a little dev sanity. See syslog for traceback.
             while exceptionCount < LensTasking.FAIL_LIMIT:  
  
                 # Task result is a tuple with a list of rectangles and a list of labels
@@ -485,25 +537,20 @@ class LensTasking:
                 try: 
                     # wait on a lens command from the Outpost
                     lens = int(outpost_recv())
+
                     if lens == LensTasking.Request_DETECT:
                         # Run object detection 
                         (rects, labels) = od.detect(frame)
-                        # Populate a new multi-tracker with objects found, if any
-                        mt = cv2.MultiTracker_create()
+                        # Populate new trackers with objects found, if any
+                        self._trkrs = self._trackers()
                         for (x1, y1, x2, y2) in rects:
-                            tracker = LensTasking.OPENCV_OBJECT_TRACKERS[cfg["tracker"]]()
-                            mt.add(tracker, frame, (x1, y1, x2-x1, y2-y1))
-                        result = (rects, labels)
+                            tracker = LensTasking.lens_factory(LensTasking.Request_TRACK, cfg)
+                            self._track_this(tracker, frame, x1, y1, x2, y2)
+                        result = (rects, labels)  # results to return
                 
                     elif lens == LensTasking.Request_TRACK:
-                        # Update object trackers
-                        (success, boxes) = mt.update(frame)
-                        # Loop over the bounding boxes and convert to an (x1, y1, x2, y2) list
-                        rects = []
-                        for box in boxes:
-                            (x, y, w, h) = [int(v) for v in box]
-                            rects.append((x, y, x+w, y+h))
-                        result = (rects, None)
+                        rects = self._update_trackers(frame)
+                        result = (rects, None)  # results to return
                     
                 except (KeyboardInterrupt, SystemExit):
                     print("LensTasking shutdown.")

@@ -293,6 +293,16 @@ class Outpost:
                             # remainder of the event. This is admitedly, a bit clumsy.
                             self.dropList[target.objectID] = True  
 
+                    # If tracking, and the Target has not moved... redetect immediately and
+                    # take note of this. Maybe the tracker got lost, or perhaps the Target 
+                    # is just standing still.
+
+                    # To do this correctly, we need more CPU power. Ideally, detection and tracking
+                    # should run in parallel, to provide for a more responsive feedback loop to
+                    # tune the tracker. This technique would run the detector more often, but only on
+                    # selected regions of interest within the image, where we already think the object 
+                    # should be. 
+
                     targets = self.sg.get_count()
                     logging.debug(f"Now tracking {targets} objects, tick {self._tick}")
                     if targets == 0:
@@ -315,7 +325,8 @@ class Outpost:
                         if self.status == Outpost.Status_ACTIVE:
                             # event in progress
                             ote = self.sg.trackingLog('trk')
-                            ote['state'] = self.state  # just curious, can see when camwatcher logging=DEBUG
+                            ote['state'] = self.state            # just curious, can see when camwatcher logging=DEBUG
+                            ote['looks'] = self._looks           # just curious, can see when camwatcher logging=DEBUG
                             for target in self.sg.get_targets():
                                 if target.upd == self.sg.lastUpdate:
                                     ote.update(target.toTrk())
@@ -332,11 +343,15 @@ class Outpost:
 
         # outpost tick count 
         self._tick += 1  
-        if self._tick % self.skip_frames == 0:  # TODO needs a better name. Not "frames".
+        if self._tick % self.skip_factor == 0: 
             # Tracking threshold encountered? Run detection again. Should perhaps measure this 
             # based on both the number of successful tracking calls, as well as an elapsed time 
             # threshold. It might make sense to formulate based on the tick count if there is
-            # an efficient way to gather metrics in-flight (something for the TODO list).
+            # an efficient way to gather metrics in-flight (something for the TODO list). Formulating
+            # a one-size-fits-all solution is not simple. Much depends on the field and depth
+            # of view. Cameras in close proximity to the subject ROI need to be able to respond 
+            # quickly to large changes in the images, such as when the subject is moving towards 
+            # the camera. Correlation tracking may not even be effective in such cases.
             if self.lenstype == Outpost.Lens_TRACK:
                 logging.debug(f"tracking threshold reached, tick {self._tick}, look {self._looks}")
                 self.lenstype = Outpost.Lens_DETECT
@@ -404,5 +419,5 @@ class Outpost:
             self.dimensions = literal_eval(config['spyglass'])
         else:
             self.dimensions = (1024, 768)
-        self.skip_frames = config["skip_frames"]
+        self.skip_factor = config["skip_factor"]
     
