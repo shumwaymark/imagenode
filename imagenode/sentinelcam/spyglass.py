@@ -546,11 +546,11 @@ class LensTasking:
                         for (x1, y1, x2, y2) in rects:
                             tracker = LensTasking.lens_factory(LensTasking.Request_TRACK, cfg)
                             self._track_this(tracker, frame, x1, y1, x2, y2)
-                        result = (rects, labels)  # results to return
+                        result = (rects, labels)
                 
                     elif lens == LensTasking.Request_TRACK:
                         rects = self._update_trackers(frame)
-                        result = (rects, None)  # results to return
+                        result = (rects, None)
                     
                 except (KeyboardInterrupt, SystemExit):
                     print("LensTasking shutdown.")
