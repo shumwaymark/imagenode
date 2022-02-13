@@ -406,8 +406,7 @@ class LensWire:
         self._poller = zmq.Poller()
         self._poller.register(self._wire.zmq_socket, zmq.POLLIN)
         self._send = self._wire.zmq_socket.send
-        self._recv = self._wire.zmq_socket.recv_pyobj
-        self.recv_handshake = self._wire.zmq_socket.recv
+        self._recv = self._wire.zmq_socket.recv
 
     def ready(self) -> bool:
         events = dict(self._poller.poll(0))
@@ -417,10 +416,10 @@ class LensWire:
             return False
     
     def send(self, lenstype) -> None:
-        self._send(str(lenstype).encode('ascii'))
+        self._send(msgpack.packb(lenstype))
     
     def recv(self) -> tuple:
-        return self._recv()
+        return msgpack.unpackb(self._recv(), use_list=False)
 
     def __del__(self) -> None:
         self._wire.close()
@@ -444,6 +443,8 @@ class LensTasking:
 
         elif lenstype == LensTasking.Request_TRACK:
             if cfg['tracker'] == 'dlib':
+                # This conditional is required for operation under OpenVINO, which
+                # does not include support for the legacy contributed trackers below
                 return dlib.correlation_tracker()
             else:
                 # This dictionary maps strings to their corresponding (now
@@ -469,7 +470,7 @@ class LensTasking:
         self.process = multiprocessing.Process(target=self._taskLoop, args=(
             self._frameBuffer, dtype, shape, cfg))
         self.process.start()
-        handshake = self._wire.recv_handshake()  # wait on handshake from subprocess
+        handshake = self._wire.recv()  # wait on handshake from subprocess
         self._sharedFrame = np.frombuffer(self._frameBuffer, dtype=dtype).reshape(shape)
         self._wire.send(handshake)  # send it right back to prime the pmup
 
@@ -521,9 +522,9 @@ class LensTasking:
             exceptionCount = 0
             frame = np.frombuffer(framebuff, dtype=dtype).reshape(shape)
             outpost = imagezmq.ImageSender(f"ipc://{LensTasking.LENS_WIRE}")
-            outpost.zmq_socket.send(str(0).encode('ascii'))  # handshake
-            outpost_send = outpost.zmq_socket.send_pyobj
+            outpost_send = outpost.zmq_socket.send
             outpost_recv = outpost.zmq_socket.recv
+            outpost_send(msgpack.packb(0))  # handshake
             
             od = LensTasking.lens_factory(LensTasking.Request_DETECT, cfg)
             self._trkrs = self._trackers()
@@ -532,25 +533,27 @@ class LensTasking:
             # Ignoring the first exception, just for a little dev sanity. See syslog for traceback.
             while exceptionCount < LensTasking.FAIL_LIMIT:  
  
-                # Task result is a tuple with a list of rectangles and a list of labels
-                result = ([], None)
+                # Task result is a tuple with the lens command, a list of rectangles, and a list of labels
+                result = (0, [], None)
                 try: 
                     # wait on a lens command from the Outpost
-                    lens = int(outpost_recv())
+                    lens = msgpack.unpackb(outpost_recv())
 
                     if lens == LensTasking.Request_DETECT:
                         # Run object detection 
                         (rects, labels) = od.detect(frame)
+                        rects_out = []
                         # Populate new trackers with objects found, if any
                         self._trkrs = self._trackers()
                         for (x1, y1, x2, y2) in rects:
                             tracker = LensTasking.lens_factory(LensTasking.Request_TRACK, cfg)
                             self._track_this(tracker, frame, x1, y1, x2, y2)
-                        result = (rects, labels)
+                            rects_out.append((int(x1), int(y1), int(x2), int(y2)))
+                        result = (lens, rects_out, labels)
                 
                     elif lens == LensTasking.Request_TRACK:
                         rects = self._update_trackers(frame)
-                        result = (rects, None)
+                        result = (lens, rects, None)
                     
                 except (KeyboardInterrupt, SystemExit):
                     print("LensTasking shutdown.")
@@ -561,7 +564,7 @@ class LensTasking:
                     traceback.print_exc()
                 finally:
                     # always reply to the Outpost
-                    outpost_send(result)
+                    outpost_send(msgpack.packb(result))
 
         except (KeyboardInterrupt, SystemExit):
             print("LensTasking ending.")
@@ -741,5 +744,5 @@ class SpyGlass:
     def terminate(self):
         self._tasking.terminate()
 
-    #def __del__(self) -> None:
-    #    self.terminate()
+    def __del__(self) -> None:
+        self.terminate()

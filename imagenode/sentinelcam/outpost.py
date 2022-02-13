@@ -63,8 +63,7 @@ class Outpost:
         self.ct = CentroidTracker(maxDisappeared=50, maxDistance=100)  # TODO: add parms to config
         self.sg = SpyGlass(viewname, self.dimensions, self.cfg)
         self.status = Outpost.Status_INACTIVE
-        self.state = Outpost.Lens_MOTION
-        self.lenstype = Outpost.Lens_MOTION
+        self.nextLens = Outpost.Lens_MOTION
         self.event_start = datetime.utcnow()
         self._lastPublished = 0
         self._heartbeat = 0
@@ -107,7 +106,13 @@ class Outpost:
         log.handlers.remove(log.handlers[0]) # OK, all logging over PUB socket only
         log.setLevel(logging.INFO)
         return log
-
+    
+    def _clear_CentroidTracker(self):
+        trkdObjs = list(self.ct.objects.keys())
+        for o in trkdObjs:
+            self.ct.deregister(o)
+        self.dropList = {}
+    
     def object_tracker(self, camera, image, send_q):
         """ Called as an imagnode Detector for each image in the pipeline.
         Using this code will deploy the SpyGlass for view and event managment.
@@ -159,6 +164,7 @@ class Outpost:
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         # Motion detection. This returns an aggregate 
         # rectangle of the estimated area of motion. 
+        lens = Outpost.Lens_MOTION
         motionRect = self.sg.detect_motion(gray)
         if motionRect: 
             self._noMotion = 0
@@ -169,7 +175,8 @@ class Outpost:
                 # need for the CentroidTracker. Just report the motion rectangle
                 # as the event data.
                 self._looks += 1
-                self.lenstype = Outpost.Lens_DETECT
+                if self.nextLens not in [Outpost.Lens_REDETECT, Outpost.Lens_RESET]:
+                    self.nextLens = Outpost.Lens_DETECT
 
         if targets > 0 or motionRect:
             # Motion was detected or already have targets in view
@@ -189,36 +196,36 @@ class Outpost:
             if self.sg.has_result(): 
 
                 # SpyGlass has results available, retrieve them now
-                (rects, labels) = self.sg.get_data()
-                logging.debug(f"LensTasking '{self.state}' result: {len(rects)} objects, tick {self._tick}")
+                (lens, rects, labels) = self.sg.get_data()
+                logging.debug(f"LensTasking lenstype {lens} result: {len(rects)} objects, tick {self._tick}")
+
+                if self.nextLens == Outpost.Lens_RESET:
+                    # This is effectively a NOOP for the SpyGlass. Clear the result set.
+                    # A lens command = 0 insures that the next result set will be empty. 
+                    self.nextLens = Outpost.Lens_MOTION
+                    rects = []
+                elif self.nextLens == Outpost.Lens_REDETECT:
+                    # If requested, clear results and apply a new lens.
+                    self.nextLens = Outpost.Lens_DETECT
+                    rects = []
+
+                # Based on the Outlook <-> SpyGlass protocol, any result set 
+                # could be old, now very stale, and just received. In which case 
+                # it's meaningless. So try to keep descision making in context.
 
                 if len(rects) > 0:
                     # Have a non-empty result set back from the 
                     # SpyGlass, note the time and default to tracking. 
                     self.sg.lastUpdate = datetime.utcnow()
-                    self.lenstype = Outpost.Lens_TRACK
-
-                    # If requested, clear results and apply a new lens.
-                    if self.state == Outpost.Lens_REDETECT:
-                        self.lenstype = Outpost.Lens_DETECT
-                        rects = []  
-                    elif self.state == Outpost.Lens_RESET:
-                        # This is effectively a NOOP for the SpyGlass. 
-                        # A lens command = 0 insures that the next result set will be empty. 
-                        self.lenstype = Outpost.Lens_MOTION 
-                        rects = []
-
+                    self.nextLens = Outpost.Lens_TRACK
                 else:
-                    # Based on the Outlook <-> SpyGlass protocol, any result set could 
-                    # be an old, now very stale, set just now received. In which case,
-                    # it's meaningless. So look again. On the other hand, this could 
-                    # just as easily represent an end to the current event.
-                    
-                    if self.state in [Outpost.Lens_MOTION, Outpost.Lens_REDETECT]:
-                        self.lenstype = Outpost.Lens_DETECT  # Keep looking as long as there is motion.
+                    # An active event could be ending, just send the NOOP?
+                    #if self.status == Outpost.Status_ACTIVE:
+                    #    self.nextLens = Outpost.Lens_MOTION
+                    logging.debug(f"No result set during event, lens {lens} nextLens {self.nextLens}, tick {self._tick}")
 
-                    if self.status == Outpost.Status_ACTIVE:
-                        self.lenstype = Outpost.Lens_MOTION  # Event could be ending, just send the NOOP?
+                if self.nextLens != lens:
+                    logging.debug(f"Changing lens from {lens} to {self.nextLens}, tick {self._tick}")
 
                 # Send current frame on out to the SpyGlass for processing.
                 # This handshake is based on a REQ/REP socket pair over ZMQ. 
@@ -235,8 +242,8 @@ class Outpost:
                 # quite a while before the next recv() if the Outpost determines there is nothing 
                 # left to look at and loses interest.
 
-                logging.debug(f"sending '{self.lenstype}' to LensTasking, tick {self._tick}, look {self._looks}")
-                self.sg.apply_lens(self.lenstype, image)
+                logging.debug(f"Sending '{self.nextLens}' to LensTasking, tick {self._tick}, look {self._looks}")
+                self.sg.apply_lens(self.nextLens, image)
 
                 # With current frame sent to the SpyGlass for analysis, there is now 
                 # time to work through the result set from the prior request, if any.
@@ -263,21 +270,21 @@ class Outpost:
                         # occur during tracking, since only detection produces new objects. 
                         if target is None:
                             if labels is None:
-                                logging.debug(f"How did we get here with obj {objectID}?")
+                                logging.debug(f"How did we get here with obj {objectID}? Lens {lens} tick {self._tick} look {self._looks}")
                                 labels=[]
                             #classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
                             if i<len(labels):
                                 classname = labels[i].split(' ')[0][:-1]
                             else:
-                                logging.debug(f"label count is {len(labels)}")
-                                for j, label in enumerate(labels):
-                                    logging.debug(f"labels[{j}]='{label}'" )
+                                #logging.debug(f"label count is {len(labels)}")
+                                #for j, label in enumerate(labels):
+                                #    logging.debug(f"labels[{j}]='{label}'" )
                                 classname = 'mystery'
                             targetText = "_".join([classname, str(objectID)])
                             target = self.sg.new_target(objectID, classname, targetText)
 
                         rect = rects[i] if i<len(rects) else (0,0,0,0)  # TODO: fix this stupid hack? - maybe not needed anymore
-                        target.update_geo(rect, centroid, self.state, self.sg.lastUpdate)
+                        target.update_geo(rect, centroid, lens, self.sg.lastUpdate)
                         logging.debug(f"update_geo:{target.toJSON()}")
 
                     for target in self.sg.get_targets():
@@ -287,56 +294,56 @@ class Outpost:
                             self.sg.drop_target(target.objectID)
                         # Keep it simple for now, only track desired object classes?
                         if target.classname != "person":
-                            logging.warning(f"Dropped [{target.classname}] obj {target.objectID} state {self.state} next {self.lenstype} tick {self._tick} look {self._looks}")
+                            logging.warning(f"Dropped [{target.classname}] obj {target.objectID} lens {lens} next {self.nextLens} tick {self._tick} look {self._looks}")
                             self.sg.drop_target(target.objectID)
                             # CentroidTracker still has this, ignore it for the 
                             # remainder of the event. This is admitedly, a bit clumsy.
                             self.dropList[target.objectID] = True  
 
-                    # If tracking, and the Target has not moved... redetect immediately and
+                    # If tracking, and the Target has not moved... re-detect immediately and
                     # take note of this. Maybe the tracker got lost, or perhaps the Target 
-                    # is just standing still.
+                    # is just standing still. (TODO)
 
                     # To do this correctly, we need more CPU power. Ideally, detection and tracking
                     # should run in parallel, to provide for a more responsive feedback loop to
                     # tune the tracker. This technique would run the detector more often, but only on
                     # selected regions of interest within the image, where we already think the object 
-                    # should be. 
+                    # should be.  In other words, this is like a HyrdaNet on the cheap. 
 
                     targets = self.sg.get_count()
                     logging.debug(f"Now tracking {targets} objects, tick {self._tick}")
                     if targets == 0:
                         # Finished processing results, and came up empty. Detection should run
                         # again by default. Note the forced change in state for the next pass.
-                        self.lenstype = Outpost.Lens_REDETECT
+                        self.nextLens = Outpost.Lens_REDETECT
                         # Also wipe the memory of the CentroidTracker, just to be certain.
-                        trkdObjs = list(self.ct.objects.keys())
-                        for o in trkdObjs:
-                            self.ct.deregister(o)
+                        self._clear_CentroidTracker()
                     else:
                         if self.status == Outpost.Status_INACTIVE:
                             # This is a new event, begin logging the tracking data
                             self.status = Outpost.Status_ACTIVE
                             ote = self.sg.new_event()
-                            ote['fps'] = self._rate.fps()
+                            ote['fps'] = self._rate.fps()        # TODO change this to tick count per second  
                             logging.info(f"ote{json.dumps(ote)}")
                             self.event_start = self.sg.event_start
 
                         if self.status == Outpost.Status_ACTIVE:
                             # event in progress
                             ote = self.sg.trackingLog('trk')
-                            ote['state'] = self.state            # just curious, can see when camwatcher logging=DEBUG
+                            ote['lens'] = lens                   # just curious, can see when camwatcher logging=DEBUG
                             ote['looks'] = self._looks           # just curious, can see when camwatcher logging=DEBUG
                             for target in self.sg.get_targets():
                                 if target.upd == self.sg.lastUpdate:
                                     ote.update(target.toTrk())
                                     logging.info(f"ote{json.dumps(ote)}")
-                    
-                elif self.lenstype == Outpost.Lens_DETECT and self.status == Outpost.Status_INACTIVE: 
-                    # current status is inactive, and object detection found nothing
-                    # assume this was a false alarm, and resume motion detection
-                    logging.debug(f"revert to motion, tick {self._tick}, look {self._looks}")
-                    self.lenstype = Outpost.Lens_MOTION
+                else:
+                    # Empty result set? Wipe the memory of the CentroidTracker; want a clean slate now.
+                    #self._clear_CentroidTracker()
+                    if lens == Outpost.Lens_DETECT and self.status == Outpost.Status_INACTIVE: 
+                        # Current status is inactive, and object detection found nothing
+                        # assume this was a false alarm, and resume motion detection?
+                        logging.debug(f"revert to motion?, tick {self._tick}, look {self._looks}")
+                        #self.nextLens = Outpost.Lens_MOTION
             else:
                 # SpyGlass ia busy. Skip this cycle and keep going. 
                 pass
@@ -347,14 +354,16 @@ class Outpost:
             # Tracking threshold encountered? Run detection again. Should perhaps measure this 
             # based on both the number of successful tracking calls, as well as an elapsed time 
             # threshold. It might make sense to formulate based on the tick count if there is
-            # an efficient way to gather metrics in-flight (something for the TODO list). Formulating
-            # a one-size-fits-all solution is not simple. Much depends on the field and depth
-            # of view. Cameras in close proximity to the subject ROI need to be able to respond 
-            # quickly to large changes in the images, such as when the subject is moving towards 
-            # the camera. Correlation tracking may not even be effective in such cases.
-            if self.lenstype == Outpost.Lens_TRACK:
+            # an efficient way to gather metrics in-flight (something for the TODO list). 
+            # As implemented, this is often out of phase from the surrounding logic, i.e. detection 
+            # may have just completed. Formulating a one-size-fits-all solution is not simple. Much 
+            # depends on the field and depth of view. Cameras in close proximity to the subject ROI 
+            # need to be able to respond quickly to large changes in the images, such as when the 
+            # subject is moving towards the camera. Correlation tracking may not even be effective
+            # in these scenarios.
+            if lens == Outpost.Lens_TRACK:
                 logging.debug(f"tracking threshold reached, tick {self._tick}, look {self._looks}")
-                self.lenstype = Outpost.Lens_DETECT
+                self.nextLens = Outpost.Lens_REDETECT
 
         stayalive = True   # Assume there is still something going on
         # If an event is in progress, is it time to end it?
@@ -380,7 +389,7 @@ class Outpost:
             if self.status == Outpost.Status_QUIET:
                 # TODO: Placeholder for something more clever.
                 # For now, just call it quits and go back to motion detection
-                logging.debug(f"Status is quiet, ending event {self.sg.eventID}, targets {targets} noMotion {self._noMotion}")
+                logging.debug(f"Status is quiet, ending event {self.sg.eventID}, targets {targets} noMotion {self._noMotion} tick {self._tick}")
                 stayalive = False
 
             if not stayalive:
@@ -391,16 +400,9 @@ class Outpost:
                 for target in self.sg.get_targets():
                     self.sg.drop_target(target.objectID)   
                 # Also, wipe the memory of the CentroidTracker.
-                trkdObjs = list(self.ct.objects.keys())
-                for o in trkdObjs:
-                    self.ct.deregister(o)
-                self.dropList = {}
-                self.lenstype = Outpost.Lens_RESET
+                self._clear_CentroidTracker()
+                self.nextLens = Outpost.Lens_RESET
                 self.status = Outpost.Status_INACTIVE
-
-        if self.state != self.lenstype:
-            logging.debug(f"State change from {self.state} to {self.lenstype}")
-            self.state = self.lenstype
 
     def setups(self, config) -> None:
         if 'camwatcher' in config:
