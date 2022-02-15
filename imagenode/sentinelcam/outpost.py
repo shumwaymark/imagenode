@@ -270,16 +270,9 @@ class Outpost:
                         # occur during tracking, since only detection produces new objects. 
                         if target is None:
                             if labels is None:
-                                logging.debug(f"How did we get here with obj {objectID}? Lens {lens} tick {self._tick} look {self._looks}")
+                                logging.error(f"How did we get here with obj {objectID}? Look {self._looks} Lens {lens} tick {self._tick}")
                                 labels=[]
-                            #classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
-                            if i<len(labels):
-                                classname = labels[i].split(' ')[0][:-1]
-                            else:
-                                #logging.debug(f"label count is {len(labels)}")
-                                #for j, label in enumerate(labels):
-                                #    logging.debug(f"labels[{j}]='{label}'" )
-                                classname = 'mystery'
+                            classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
                             targetText = "_".join([classname, str(objectID)])
                             target = self.sg.new_target(objectID, classname, targetText)
 
@@ -308,7 +301,8 @@ class Outpost:
                     # should run in parallel, to provide for a more responsive feedback loop to
                     # tune the tracker. This technique would run the detector more often, but only on
                     # selected regions of interest within the image, where we already think the object 
-                    # should be.  In other words, this is like a HyrdaNet on the cheap. 
+                    # should be. This is how a country boy might try build something that attempts to
+                    # masquerade as a HyrdaNet. 
 
                     targets = self.sg.get_count()
                     logging.debug(f"Now tracking {targets} objects, tick {self._tick}")
