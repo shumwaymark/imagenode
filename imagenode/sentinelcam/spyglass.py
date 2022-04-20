@@ -10,6 +10,7 @@ License: MIT, see the sentinelcam LICENSE for more details.
 
 import os
 import json
+import logging
 import traceback
 import uuid
 import cv2
@@ -20,6 +21,7 @@ import numpy as np
 import msgpack
 import multiprocessing
 from multiprocessing import sharedctypes
+from time import sleep
 from datetime import datetime
 from collections import OrderedDict
 from scipy.spatial import distance as dist
@@ -526,15 +528,21 @@ class LensTasking:
             outpost_recv = outpost.zmq_socket.recv
             outpost_send(msgpack.packb(0))  # handshake
             
-            od = LensTasking.lens_factory(LensTasking.Request_DETECT, cfg)
-            self._trkrs = self._trackers()
+            if not cfg["detectobjects"] in ["none","motion"]:
+                od = LensTasking.lens_factory(LensTasking.Request_DETECT, cfg)
+                sleep(3.0)
+            if cfg['tracker'] == "none":
+                self._doTracking = False
+            else:
+                self._doTracking = True
+                self._trkrs = self._trackers()
             print("LensTasking started.")
             
             # Ignoring the first exception, just for a little dev sanity. See syslog for traceback.
             while exceptionCount < LensTasking.FAIL_LIMIT:  
  
                 # Task result is a tuple with the lens command, a list of rectangles, and a list of labels
-                result = (0, [], None)
+                result = (0, [], [])
                 try: 
                     # wait on a lens command from the Outpost
                     lens = msgpack.unpackb(outpost_recv())
@@ -543,12 +551,14 @@ class LensTasking:
                         # Run object detection 
                         (rects, labels) = od.detect(frame)
                         rects_out = []
-                        # Populate new trackers with objects found, if any
-                        self._trkrs = self._trackers()
+                        if self._doTracking:
+                            # Populate new trackers with objects found, if any
+                            self._trkrs = self._trackers()
                         for (x1, y1, x2, y2) in rects:
-                            tracker = LensTasking.lens_factory(LensTasking.Request_TRACK, cfg)
-                            self._track_this(tracker, frame, x1, y1, x2, y2)
                             rects_out.append((int(x1), int(y1), int(x2), int(y2)))
+                            if self._doTracking:
+                                tracker = LensTasking.lens_factory(LensTasking.Request_TRACK, cfg)
+                                self._track_this(tracker, frame, x1, y1, x2, y2)
                         result = (lens, rects_out, labels)
                 
                     elif lens == LensTasking.Request_TRACK:
@@ -558,6 +568,8 @@ class LensTasking:
                 except (KeyboardInterrupt, SystemExit):
                     print("LensTasking shutdown.")
                     exceptionCount = LensTasking.FAIL_LIMIT  # allow shutdown to continue
+                except cv2.error as e:
+                    print(f"OpenCV error trapped: {str(e)}")
                 except Exception as ex:
                     exceptionCount += 1
                     print(f"LensTasking failure #{exceptionCount}.")
@@ -639,10 +651,12 @@ class SpyGlass:
         - timestamp of last update
         - source of update (lens/tracker/dropped)
         - bounding rectangle within the view
+        - Z-coordinate(s) within the view
         - geometric centroid within view
         - status? (still, vanished, in motion / direction of travel, velocity?)
         - classification
         - identification
+        - confidence
         - label / text comment
         - color (for drawing rectangles on images)
     
@@ -692,8 +706,10 @@ class SpyGlass:
     def __init__(self, view, camsize, cfg) -> None:
         self._tasking = LensTasking(camsize, cfg)
         self._motion = LensMotion()
-        self._targets = {}  # dictionary of Targets by objectID
-        self._logdata = {}  # tracking event data for logging
+        self._ct = CentroidTracker(maxDisappeared=50, maxDistance=100)  # TODO: add parms to config
+        self._dropList = {}  # unwanted objects
+        self._targets = {}   # dictionary of Targets by objectID
+        self._logdata = {}   # tracking event data for logging
         self.eventID = None
         self.view = view
         self.lastUpdate = datetime.utcnow()
@@ -746,3 +762,53 @@ class SpyGlass:
 
     def __del__(self) -> None:
         self.terminate()
+    
+    def resetTargetList(self):
+        for target in self.get_targets():
+            self.drop_target(target.objectID)   
+        trkdObjs = list(self._ct.objects.keys())
+        for o in trkdObjs:
+            self._ct.deregister(o)
+        self._dropList = {}
+
+    def reviseTargetList(self, lens, rects, labels) -> bool:
+        # Centroid tracking algorithm courtesy of PyImageSearch.
+        # Using this to map tracked object centroids back to a  
+        # dictionary of targets managed by the SpyGlass
+        centroids = self._ct.update(rects)
+
+        # TODO: Need to validate CentroidTracker initilization and overall
+        # fit within the context of the Outpost use cases. Specifically the
+        # max disappeared limit.
+        interestingTargetFound = False
+        for i, (objectID, centroid) in enumerate(centroids.items()):
+
+            # Ignore anything on the drop list
+            if objectID in self._dropList:
+                continue
+
+            # Grab the SpyGlass target via its object ID
+            target = self.get_target(objectID)
+
+            # Create new targets for tracking as needed. 
+            if target is None:
+                classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
+                targetText = "_".join([classname, str(objectID)])
+                target = self.new_target(objectID, classname, targetText)
+
+            rect = rects[i] if i<len(rects) else (0,0,0,0)  # TODO: fix this stupid hack? - maybe not needed anymore
+            target.update_geo(rect, centroid, lens, self.lastUpdate)
+            logging.debug(f"update_geo:{target.toJSON()}")
+
+        for target in self.get_targets():
+
+            # Drop vanished objects from SpyGlass 
+            if target.objectID not in self._ct.objects.keys():
+                logging.debug(f"Target {target.objectID} vanished")
+                self.drop_target(target.objectID)
+
+            # when does it get interesting?
+            elif target.classname == "person":
+                interestingTargetFound = True
+
+        return interestingTargetFound

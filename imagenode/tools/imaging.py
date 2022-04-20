@@ -28,7 +28,7 @@ from tools.utils import interval_timer
 from tools.nodehealth import HealthMonitor
 from tools.utils import versionCompare
 from pkg_resources import require
-from sentinelcam.outpost import Outpost # SentineCam outpost support
+from sentinelcam.outpost import Outpost, OAKcamera # SentineCam outpost support
 
 
 class ImageNode:
@@ -642,9 +642,9 @@ class Sensor:
         """
         if self.type == 'DS18B20':
             if self.unit == 'C':
-                temperature = int(self.temp_sensor.get_temperature(W1ThermSensor.DEGREES_C))
-            else:
-                temperature = int(self.temp_sensor.get_temperature(W1ThermSensor.DEGREES_F))
+                temperature = int(self.temp_sensor.get_temperature('celsius'))  # W1ThermSensor.DEGREES_C
+            else: 
+                temperature = int(self.temp_sensor.get_temperature('fahrenheit'))  # W1ThermSensor.DEGREES_F
             humidity = -999
         if (self.type == 'DHT11') or (self.type == 'DHT22'):
             for i in range(5):  # try for valid readings 5 times; break if valid
@@ -858,7 +858,7 @@ class Camera:
                                  self.viewname)
         if camera[0].lower() == 'p':  # this is a picam
             # start PiCamera and warm up; inherits methods from
-            # imutils.VideoStream unless threaded_read is False; then uses class
+            # imutils.VideoStream unless threaded_read is False; `then uses class
             # PiCameraUnthreadedStream to read the PiCamera in an unthreaded way
             if self.threaded_read:
                 self.cam = VideoStream(usePiCamera=True,
@@ -893,6 +893,9 @@ class Camera:
             if self.awb_mode:
                 self.cam.camera.awb_mode = self.awb_mode
             self.cam_type = 'PiCamera'
+        elif camera[0].lower() == 'o':  # OAK camera
+            self.cam = OAKcamera(self.viewname)
+            self.cam_type = 'OAKcamera'
         else:  # this is a webcam (not a picam)
             self.cam = VideoStream(src=0).start()
             self.cam_type = 'webcam'
