@@ -85,6 +85,7 @@ class Outpost:
         self._noMotion = 0
         self._looks = 0
         self._tick = 0
+        self._evts = 0
         if self.depthAI:
             self.setup_OAK(config["depthai"])
 
@@ -162,7 +163,7 @@ class Outpost:
                 mm = self._rate.update().minute
                 if mm % 5 == 0 and mm != self._heartbeat[1]: 
                     tickrate = (self._tick - self._heartbeat[0]) / (5 * 60)
-                    logging.info(f"fps({self._tick}, {self._looks}, {tickrate:.2f}, {self._rate.fps():.2f})")
+                    logging.info(f"fps({self._tick}, {self._looks}, {self._evts}, {tickrate:.2f}, {self._rate.fps():.2f})")
                     self._heartbeat = (self._tick, mm)
 
         rects = []                      # fresh start here, no determinations made
@@ -336,6 +337,7 @@ class Outpost:
                         ote['fps'] = self._rate.fps()
                         logging.info(f"ote{json.dumps(ote)}")
                         self.event_start = self.sg.event_start
+                        self._evts += 1
 
                 if self.status == Outpost.Status_ACTIVE:
                     # event in progress
