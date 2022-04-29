@@ -141,6 +141,7 @@ class Outpost:
                     # TODO: Question: does the threshold above need to allow for image 
                     # compression overhead? Asked for 32 FPS, getting about 24-25 per second 
                     # for a (640,480) image size, within a pipeline velocity of 40-50 ticks/second.
+                    # Inexplicably, publishing rates seem to increase slightly as subscribers connect.
                 else:
                     buffer = None
             elif self.encoder[0] == 'o':
@@ -204,32 +205,30 @@ class Outpost:
             # When running DepthAI on an OAK camera, pull down any neural net results now. 
             # SpyGlass can provide for optional supplemental analysis, append any such results afterwards.
             cnt = 0
-            imageSeqThreshold = camera.cam.getImgFrame().getSequenceNum() - 2
+            imageSeqThreshold = camera.cam.getImgFrame().getSequenceNum() 
             normVals = np.full(4, self.dimensions[1])
             normVals[::2] = self.dimensions[0]
             for net in self.nnQs:
                 # multiple neural nets may be used in parallel 
                 for nnMsg in net.tryGetAll(): 
-                    # Each message relates to a single image, and can contain multiple results.
-                    # Discard history up to an estimated starting point to better align with 
-                    # the current image. This is an experimental factor used for initial testing. 
+                    # Each message relates to a single image, and can contain multiple results. For this
+                    # initial shakedown, no assumptions regarding synchronization to the current frame are 
+                    # implemented. This should be OK, as long as the content of each queue is closely aligned.
                     nnSeq = nnMsg.getSequenceNum()
-                    if nnSeq < imageSeqThreshold:  
-                        logging.debug(f"Discarding ImgDetection sequence {nnSeq}")
-                    else:
-                        (rects, labels) = ([],[])
-                        for nnDet in nnMsg.detections:
-                            bbox = [nnDet.xmin, nnDet.ymin, nnDet.xmax, nnDet.ymax]
-                            logging.debug(f"nnDet[{cnt}] {nnDet.label}, bbox {bbox} image {nnSeq}, look {self._looks}")
-                            # normalize detection result bounding boxes to frame dimensioms 
-                            bbox = np.array(bbox)
-                            rects.append((np.clip(bbox, 0, 1) * normVals).astype(int))
-                            labels.append("{}: {:.4f}".format(
-                                Outpost.MobileNetSSD_labels[nnDet.label],
-                                nnDet.confidence))
-                            cnt += 1
-                        interesting = self.sg.reviseTargetList(Outpost.Lens_DETECT, rects, labels)
-                        if interesting:
+                    if nnSeq > imageSeqThreshold:  
+                        logging.debug(f"ImgDetection sequence {nnSeq}, ImgFrame sequence {imageSeqThreshold}")
+                    rects, labels = [],[]
+                    for nnDet in nnMsg.detections:
+                        text = Outpost.MobileNetSSD_labels[nnDet.label]
+                        logging.debug(f"nnDet[{cnt}] image {nnSeq}, {text}, look {self._looks}")
+                        # normalize detection result bounding boxes to frame dimensioms 
+                        bbox = np.array([nnDet.xmin, nnDet.ymin, nnDet.xmax, nnDet.ymax])
+                        rects.append((np.clip(bbox, 0, 1) * normVals).astype(int))
+                        labels.append("{}: {:.4f}".format(text, nnDet.confidence))
+                        cnt += 1
+                    if len(rects) > 0:
+                        interested = self.sg.reviseTargetList(Outpost.Lens_DETECT, rects, labels)
+                        if interested:
                             interestingTargetFound = True
             if cnt:
                 # TODO: might want to apply a special lens to the SpyGlass?
@@ -330,7 +329,7 @@ class Outpost:
                 self.nextLens = Outpost.Lens_REDETECT
             else:
                 if self.status == Outpost.Status_INACTIVE:
-                    if interestingTargetFound or (motionRect and self.motion_only):
+                    if motionRect and (interestingTargetFound or self.motion_only):
                         # This is a new event, begin logging the tracking data
                         self.status = Outpost.Status_ACTIVE
                         ote = self.sg.new_event()
@@ -399,11 +398,6 @@ class Outpost:
                 self.sg.resetTargetList()
                 self.nextLens = Outpost.Lens_RESET
                 self.status = Outpost.Status_INACTIVE
-        else:
-            # temporary hack after DepthAI changes: shutdown a runaway SpyGlass?
-            if targets > 0 and self._noMotion > 2:
-                self.sg.resetTargetList()
-                self.nextLens = Outpost.Lens_RESET
 
     def setups(self, config) -> None:
         if 'camwatcher' in config:
@@ -443,7 +437,7 @@ class Outpost:
         self.jpegQ = self.oak.getOutputQueue(name=config["jpegs"], maxSize=4, blocking=False)
         self.nnQs = []
         for net in config['neural_nets'].values():
-            self.nnQs.append(self.oak.getOutputQueue(name=net, maxSize=50, blocking=False))
+            self.nnQs.append(self.oak.getOutputQueue(name=net, maxSize=4, blocking=False))
             logging.debug(f"DepthAI neural net queue '{net}' opened")
         Outpost.oakCameras[self.viewname] = self.frameQ
 

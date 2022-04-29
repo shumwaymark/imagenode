@@ -779,8 +779,12 @@ class SpyGlass:
 
         # TODO: Need to validate CentroidTracker initilization and overall
         # fit within the context of the Outpost use cases. Specifically the
-        # max disappeared limit.
+        # max disappeared limit. The real gap in thinking is likely the assumption
+        # that an ocurrence number from the list of rects provides for a reliable 
+        # mapping to objectID occurences coming out of the Centroid Tracker. 
+        # Too many edge cases around this approach. Not a robust solution. 
         interestingTargetFound = False
+        self.lastUpdate = datetime.utcnow()
         for i, (objectID, centroid) in enumerate(centroids.items()):
 
             # Ignore anything on the drop list
@@ -796,7 +800,7 @@ class SpyGlass:
                 targetText = "_".join([classname, str(objectID)])
                 target = self.new_target(objectID, classname, targetText)
 
-            rect = rects[i] if i<len(rects) else (0,0,0,0)  # TODO: fix this stupid hack? - maybe not needed anymore
+            rect = rects[i] if i<len(rects) else (0,0,0,0)  # TODO: fix this stupid hack? (serves as a fail-safe)
             target.update_geo(rect, centroid, lens, self.lastUpdate)
             logging.debug(f"update_geo:{target.toJSON()}")
 
