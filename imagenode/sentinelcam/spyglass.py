@@ -610,7 +610,6 @@ class Target:
 		self.classname = classname
 		self.source = 'lens'
 		self.text = label
-		#self.color = tuple(np.random.randint(256, size=3))  # cannot pass to OpenCV.rectangle() like this :-/
 	def update_geo(self, rect, cent, source, wen) -> None:
 		self.rect = rect 
 		self.cent = cent 
@@ -703,19 +702,32 @@ class SpyGlass:
     terminate() -> None
         kill the LensTasking subprocess. Be courteous and call this as a part of imagenode shutdown
     """
+    State_BUSY = 0
+    State_RESULT = 1 
+
+    State = ["SpyGlass is busy", "SpyGlass has result"]
+
     def __init__(self, view, camsize, cfg) -> None:
         self._tasking = LensTasking(camsize, cfg)
         self._motion = LensMotion()
-        self._ct = CentroidTracker(maxDisappeared=50, maxDistance=100)  # TODO: add parms to config
+        self._ct = CentroidTracker(maxDisappeared=3, maxDistance=100)  # TODO: add parms to config
         self._dropList = {}  # unwanted objects
         self._targets = {}   # dictionary of Targets by objectID
         self._logdata = {}   # tracking event data for logging
         self.eventID = None
         self.view = view
+        self.state = SpyGlass.State_BUSY
         self.lastUpdate = datetime.utcnow()
     
     def has_result(self) -> bool:
-        return self._tasking.is_ready()
+        if self._tasking.is_ready():
+            self.state = SpyGlass.State_RESULT
+        else:
+            self.state = SpyGlass.State_BUSY
+        return self.state == SpyGlass.State_RESULT
+    
+    def get_state(self) -> int:
+        return self.state
     
     def get_data(self) -> tuple:
         return self._tasking.get_result()
@@ -771,7 +783,7 @@ class SpyGlass:
             self._ct.deregister(o)
         self._dropList = {}
 
-    def reviseTargetList(self, lens, rects, labels) -> bool:
+    def reviseTargetList(self, lens, rects, labels) -> tuple:
         # Centroid tracking algorithm courtesy of PyImageSearch.
         # Using this to map tracked object centroids back to a  
         # dictionary of targets managed by the SpyGlass
@@ -783,6 +795,7 @@ class SpyGlass:
         # that an ocurrence number from the list of rects provides for a reliable 
         # mapping to objectID occurences coming out of the Centroid Tracker. 
         # Too many edge cases around this approach. Not a robust solution. 
+        newTarget = False
         interestingTargetFound = False
         self.lastUpdate = datetime.utcnow()
         for i, (objectID, centroid) in enumerate(centroids.items()):
@@ -796,7 +809,8 @@ class SpyGlass:
 
             # Create new targets for tracking as needed. 
             if target is None:
-                classname = labels[i].split(' ')[0][:-1] if i < len(labels) else 'mystery'
+                newTarget = True
+                classname = labels[i].split(' ')[0][:-1] if labels and i < len(labels) else 'mystery'
                 targetText = "_".join([classname, str(objectID)])
                 target = self.new_target(objectID, classname, targetText)
 
@@ -815,4 +829,4 @@ class SpyGlass:
             elif target.classname == "person":
                 interestingTargetFound = True
 
-        return interestingTargetFound
+        return (newTarget, interestingTargetFound)

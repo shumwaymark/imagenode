@@ -49,9 +49,10 @@ class Outpost:
     Lens_TRACK = 2
     Lens_REDETECT = 3
     Lens_RESET = 4
+    Lens_depthAI = 5
 
-    Lens = ["Motion","Detect","Track","ReDetect","Reset"]
-
+    Lens = ["Motion","Detect","Track","ReDetect","Reset","depthAI"]
+    
     # MobilenetSSD label texts
     MobileNetSSD_labels = ["background", "aeroplane", "bicycle", "bird", 
         "boat", "bottle", "bus", "car", "cat", "chair", "cow",
@@ -170,6 +171,7 @@ class Outpost:
         rects = []                      # fresh start here, no determinations made
         targets = self.sg.get_count()   # number of ojects tracked by the SpyGlass
         interestingTargetFound = False  # only begin event capture when interested
+        newTarget = False               # flag indicates new target entered field of view
 
         # Always apply the motion detector. It's fast and the information 
         # is generally useful. Apply background subtraction model within
@@ -205,6 +207,7 @@ class Outpost:
             # When running DepthAI on an OAK camera, pull down any neural net results now. 
             # SpyGlass can provide for optional supplemental analysis, append any such results afterwards.
             cnt = 0
+            lens = Outpost.Lens_depthAI
             imageSeqThreshold = camera.cam.getImgFrame().getSequenceNum() 
             normVals = np.full(4, self.dimensions[1])
             normVals[::2] = self.dimensions[0]
@@ -227,18 +230,18 @@ class Outpost:
                         labels.append("{}: {:.4f}".format(text, nnDet.confidence))
                         cnt += 1
                     if len(rects) > 0:
-                        interested = self.sg.reviseTargetList(Outpost.Lens_DETECT, rects, labels)
+                        newTarget, interested = self.sg.reviseTargetList(self.Lens, rects, labels)
                         if interested:
                             interestingTargetFound = True
             if cnt:
                 # TODO: might want to apply a special lens to the SpyGlass?
                 self.nextLens = Outpost.Lens_MOTION  
 
-        if self.spyGlassOnly and (targets > 0 or motionRect):
+        if self.spyGlassOnly and (motionRect or self.status == Outpost.Status_ACTIVE):
             # ----------------------------------------------------------------------------------------
             #                     SpyGlass-only draft design pattern
             # ----------------------------------------------------------------------------------------
-            # Motion was detected or already have targets in view
+            # Motion was detected or an event is already in progress
             # Alternating between detection and tracking 
             # - object detection first, begin looking for characteristics on success
             # - initiate and run with tracking after objects detected
@@ -256,7 +259,7 @@ class Outpost:
 
                 # SpyGlass has results available, retrieve them now
                 (lens, rects, labels) = self.sg.get_data()
-                logging.debug(f"LensTasking lenstype {lens} result: {len(rects)} objects, motionRect {motionRect}, tick {self._tick}")
+                logging.debug(f"LensTasking lenstype {lens} result: {len(rects)} objects, tick {self._tick}")
 
                 if self.nextLens == Outpost.Lens_RESET:
                     # This is effectively a NOOP for the SpyGlass, clearing current results.
@@ -297,13 +300,13 @@ class Outpost:
                 # quite a while before the next recv() if the Outpost determines there is nothing 
                 # left to look at and loses interest.
 
-                logging.debug(f"Sending '{self.nextLens}' to LensTasking, tick {self._tick}, look {self._looks}")
+                logging.debug(f"Sending '{self.nextLens}' to LensTasking, tick {self._tick}, look {self._looks}, motionRect {motionRect}")
                 self.sg.apply_lens(self.nextLens, image)
 
                 # With current frame sent to the SpyGlass for analysis, there is now 
                 # time to work through the result set from the prior request, if any.
                 if self.spyGlassOnly and len(rects) > 0:
-                    interestingTargetFound = self.sg.reviseTargetList(lens, rects, labels)
+                    newTarget, interestingTargetFound = self.sg.reviseTargetList(lens, rects, labels)
 
                 # To do this correctly, we need more CPU power. Ideally, detection and tracking
                 # should run in parallel to provide for a more responsive feedback loop to
@@ -316,20 +319,12 @@ class Outpost:
                 # SpyGlass is busy. Skip this cycle and keep going. 
                 pass
 
-        if len(rects) > 0:
-            # If tracking and any Target of interest has not moved, re-detect immediately
-            # and take note of this. Maybe the tracker got lost, or perhaps the Target 
-            # is just standing still. (TODO)
-
+        if len(rects) > 0:  # New result set available. Begin event or continue logging as appropriate.
             targets = self.sg.get_count()
-            logging.debug(f"Now tracking {targets} objects, tick {self._tick}")
-            if targets == 0:
-                # Finished processing results, and came up empty. Detection should run
-                # again by default. Note the forced change in state for the next pass.
-                self.nextLens = Outpost.Lens_REDETECT
-            else:
-                if self.status == Outpost.Status_INACTIVE:
-                    if motionRect and (interestingTargetFound or self.motion_only):
+            logging.debug(f"Now tracking {targets} objects, tick {self._tick}, {Outpost.Status[self.status]}")
+            if targets > 0:
+                if self.status != Outpost.Status_ACTIVE:
+                    if self.motion_only or (newTarget and interestingTargetFound):
                         # This is a new event, begin logging the tracking data
                         self.status = Outpost.Status_ACTIVE
                         ote = self.sg.new_event()
@@ -341,13 +336,11 @@ class Outpost:
                 if self.status == Outpost.Status_ACTIVE:
                     # event in progress
                     ote = self.sg.trackingLog('trk')
-                    ote['lens'] = lens                   # just curious, can see when camwatcher logging=DEBUG
-                    ote['looks'] = self._looks           # just curious, can see when camwatcher logging=DEBUG
                     for target in self.sg.get_targets():
                         if target.upd == self.sg.lastUpdate:
                             ote.update(target.toTrk())
                             logging.info(f"ote{json.dumps(ote)}")
-        
+
         # outpost tick count 
         self._tick += 1  
         if self._tick % self.skip_factor == 0: 
@@ -361,24 +354,25 @@ class Outpost:
             # need to be able to respond quickly to large changes in the images, such as when the 
             # subject is moving towards the camera. Correlation tracking may not even be effective
             # in these scenarios.
-            if lens == Outpost.Lens_TRACK:
-                logging.debug(f"tracking threshold reached, tick {self._tick}, look {self._looks}")
-                self.nextLens = Outpost.Lens_REDETECT
+            if self.nextLens == Outpost.Lens_TRACK and self.status == Outpost.Status_ACTIVE:
+                if targets > 0:
+                    logging.debug(f"tracking threshold reached, tick {self._tick}, look {self._looks}")
+                    self.nextLens = Outpost.Lens_REDETECT
 
         if self.status == Outpost.Status_ACTIVE:
             # If an event is in progress, is it time to end it?
-            stayalive = True   # Assume there is still something going on
+            runLogger = True   # Assume there is still something going on
             if targets == 0:
-                stayalive = False
+                runLogger = False
+                self.status = Outpost.Status_INACTIVE
                 logging.debug(f"Event {self.sg.eventID} is tracking no targets")
             elif self._noMotion > 5:
-                # This is more bandaid than correct. Mostly because the 
-                # CentroidTracker is currently hanging on to objects longer 
-                # than necessary
+                # This is more bandaid than correct. TODO: Need strategy 
+                # for managing scene transition from one state to another.
                 self.status = Outpost.Status_QUIET
             else:
                 # Fail safe kill switch, forced shutdown after 15 seconds. 
-                # TODO: Design flexibility for this via ruleset in configuration?
+                # TODO: Need above/below as configurable ruleset, event limit.
                 #  ----------------------------------------------------------
                 event_elapsed = datetime.utcnow() - self.event_start
                 if event_elapsed.seconds > 15:
@@ -388,16 +382,24 @@ class Outpost:
                 # TODO: Placeholder for something more clever.
                 # For now, just call it quits and go back to motion detection
                 logging.debug(f"Status is quiet, ending event {self.sg.eventID}, targets {targets} noMotion {self._noMotion} tick {self._tick}")
-                stayalive = False
+                runLogger = False
 
-            if not stayalive:
+            if not runLogger:
                 logging.info(f"ote{json.dumps(self.sg.trackingLog('end'))}")
-                # Ultimately, need more smarts around this. For now though,
-                # this is quick, easy, and painless. Just erase the SpyGlass
-                # memory and reset for a fresh start.
+                self.nextLens = Outpost.Lens_RESET
+        
+        elif self.status == Outpost.Status_QUIET:
+            if self.sg.get_state() == SpyGlass.State_RESULT:
+                if len(rects) == 0 and self._noMotion > 3:
+                    self.sg.resetTargetList()
+                    targets = 0
+                if targets == 0 or not interestingTargetFound:
+                    logging.debug("Transition from quiet to inactive")
+                    self.status = Outpost.Status_INACTIVE
+        else:
+            if targets > 0 and self.sg.get_state() == SpyGlass.State_RESULT and not interestingTargetFound:
                 self.sg.resetTargetList()
                 self.nextLens = Outpost.Lens_RESET
-                self.status = Outpost.Status_INACTIVE
 
     def setups(self, config) -> None:
         if 'camwatcher' in config:
