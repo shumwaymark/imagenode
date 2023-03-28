@@ -98,22 +98,23 @@ class Outpost:
         zmq_log_handler.root_topic = self.nodename
         log.addHandler(zmq_log_handler)
         if self.camwatcher:
+            _host = socket.gethostname()
             handoff = {'node': self.nodename, 
-                       'log': self.publish_log, 
-                       'video': self.publish_cam,
-                       'host': socket.gethostname()}
+                       'view': self.viewname, 
+                       'logger': f"tcp://{_host}:{self.publish_log}",
+                       'images': f"tcp://{_host}:{self.publish_cam}"}
             msg = "CameraUp|" + json.dumps(handoff)
             try:
                 with zmq.Context().socket(zmq.REQ) as sock:
                     log.debug('connecting to ' + self.camwatcher)
                     sock.connect(self.camwatcher)
                     sock.send(msg.encode("ascii"))
-                    resp = sock.recv().decode("ascii")
-            except Exception as ex:
-                log.exception('Unable to connect with camwatcher:' + ex)
-                sys.exit()
-        log.handlers.remove(log.handlers[0]) # OK, all logging over PUB socket only
-        log.setLevel(logging.INFO)
+            except Exception as e:
+                log.warning(f"Outpost.start_logPublisher(), Exception: {str(e)})")
+                log.setLevel(logging.WARNING)  # No event data logging supported
+            else:
+                log.handlers.remove(log.handlers[0]) # OK, all logging over PUB socket only
+                log.setLevel(logging.INFO)
         return log
     
     def object_tracker(self, camera, image, send_q):
@@ -173,9 +174,8 @@ class Outpost:
         interestingTargetFound = False  # only begin event capture when interested
         newTarget = False               # flag indicates new target entered field of view
 
-        # Always apply the motion detector. It's fast and the information 
-        # is generally useful. Apply background subtraction model within
-        # region of interest only.
+        # Always apply the motion detector. It's fast and the information is generally useful. 
+        # Apply background subtraction model within region of interest only.
         x1, y1 = self.detector.top_left
         x2, y2 = self.detector.bottom_right
         ROI = image[y1:y2, x1:x2]
@@ -329,6 +329,8 @@ class Outpost:
                         self.status = Outpost.Status_ACTIVE
                         ote = self.sg.new_event()
                         ote['fps'] = self._rate.fps()
+                        ote['camsize'] = self.dimensions
+                        ote['timestamp'] = self._rate.lastStamp().isoformat()
                         logging.info(f"ote{json.dumps(ote)}")
                         self.event_start = self.sg.event_start
                         self._evts += 1
@@ -336,6 +338,7 @@ class Outpost:
                 if self.status == Outpost.Status_ACTIVE:
                     # event in progress
                     ote = self.sg.trackingLog('trk')
+                    ote['timestamp'] = self._rate.lastStamp().isoformat()
                     for target in self.sg.get_targets():
                         if target.upd == self.sg.lastUpdate:
                             ote.update(target.toTrk())
