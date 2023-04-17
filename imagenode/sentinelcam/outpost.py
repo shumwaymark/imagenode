@@ -105,7 +105,7 @@ class Outpost:
                        'images': f"tcp://{_host}:{self.publish_cam}"}
             msg = "CameraUp|" + json.dumps(handoff)
             try:
-                with zmq.Context().socket(zmq.REQ) as sock:
+                with zmq.Context().instance().socket(zmq.REQ) as sock:
                     log.debug('connecting to ' + self.camwatcher)
                     sock.connect(self.camwatcher)
                     sock.send(msg.encode("ascii"))
@@ -301,7 +301,7 @@ class Outpost:
                 # left to look at and loses interest.
 
                 logging.debug(f"Sending '{self.nextLens}' to LensTasking, tick {self._tick}, look {self._looks}, motionRect {motionRect}")
-                self.sg.apply_lens(self.nextLens, image)
+                self.sg.apply_lens(self.nextLens, image, self._rate.lastStamp())
 
                 # With current frame sent to the SpyGlass for analysis, there is now 
                 # time to work through the result set from the prior request, if any.
@@ -323,6 +323,19 @@ class Outpost:
             targets = self.sg.get_count()
             logging.debug(f"Now tracking {targets} objects, tick {self._tick}, {Outpost.Status[self.status]}")
             if targets > 0:
+                if self.sg.get_state() == SpyGlass.State_BUSY:
+                    logtime = self._rate.lastStamp().isoformat()
+                else:
+                    logtime = self.sg.get_frametime().isoformat()
+                    # This is the frame timestamp associated with the SpyGlass result set. Be careful
+                    # if/when mixing with current result sets from a DepthAI pipeline. Logged data needs 
+                    # to correspond to the frame timestamp associated with the image being reported.
+                    # TODO: Need consideration here for event start. If SpyGlass results are used as the
+                    # trigger to fire off a new event, the start of the image capture process will lag 
+                    # behind that initial result. A better solution: begin image capture when motion first
+                    # detected. If the SpyGlass comes up with nothing, end capture and delete empty event.
+                    # This requires careful fine-tuning of the motion detector to avoid unecessary system 
+                    # stress.
                 if self.status != Outpost.Status_ACTIVE:
                     if self.motion_only or (newTarget and interestingTargetFound):
                         # This is a new event, begin logging the tracking data
@@ -330,7 +343,7 @@ class Outpost:
                         ote = self.sg.new_event()
                         ote['fps'] = self._rate.fps()
                         ote['camsize'] = self.dimensions
-                        ote['timestamp'] = self._rate.lastStamp().isoformat()
+                        ote['timestamp'] = logtime
                         logging.info(f"ote{json.dumps(ote)}")
                         self.event_start = self.sg.event_start
                         self._evts += 1
@@ -338,7 +351,7 @@ class Outpost:
                 if self.status == Outpost.Status_ACTIVE:
                     # event in progress
                     ote = self.sg.trackingLog('trk')
-                    ote['timestamp'] = self._rate.lastStamp().isoformat()
+                    ote['timestamp'] = logtime
                     for target in self.sg.get_targets():
                         if target.upd == self.sg.lastUpdate:
                             ote.update(target.toTrk())

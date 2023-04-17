@@ -336,7 +336,9 @@ class SpyGlass:
         self.eventID = None
         self.view = view
         self.state = SpyGlass.State_BUSY
-        self.lastUpdate = datetime.utcnow()
+        self.sgTime = datetime.utcnow()
+        self.frametime = self.sgTime
+        self.lastUpdate = self.sgTime
     
     def has_result(self) -> bool:
         if self._tasking.is_ready():
@@ -349,10 +351,15 @@ class SpyGlass:
         return self.state
     
     def get_data(self) -> tuple:
+        self.frametime = self.sgTime
         return self._tasking.get_result()
+    
+    def get_frametime(self) -> datetime:
+        return self.frametime
 
-    def apply_lens(self, lenstype, image) -> None:
+    def apply_lens(self, lenstype, image, frametime) -> None:
         self._tasking.apply_lens(lenstype, image)
+        self.sgTime = frametime
 
     def new_target(self, item, classname, label) -> Target:
         self._targets[item] = Target(item, classname, label)
