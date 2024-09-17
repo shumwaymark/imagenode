@@ -80,7 +80,7 @@ class Outpost:
         self.sg = SpyGlass(viewname, self.dimensions, self.cfg)
         self.status = Outpost.Status_INACTIVE
         self.nextLens = Outpost.Lens_MOTION
-        self.event_start = datetime.utcnow()
+        self.event_start = datetime.now()
         self._lastPublished = 0
         self._heartbeat = (0,0)
         self._noMotion = 0
@@ -163,7 +163,8 @@ class Outpost:
                 self._lastPublished = ns
                 # Heartbeat message with current pipeline frame rates over the logger. 
                 # TODO: Make this a configurable setting. Currently every 5 minutes.
-                mm = self._rate.update().minute
+                self._rate.update()
+                mm = self._rate.get_min()
                 if mm % 5 == 0 and mm != self._heartbeat[1]: 
                     tickrate = (self._tick - self._heartbeat[0]) / (5 * 60)
                     logging.info(f"fps({self._tick}, {self._looks}, {self._evts}, {tickrate:.2f}, {self._rate.fps():.2f})")
@@ -278,7 +279,7 @@ class Outpost:
                 if len(rects) > 0:
                     # Have a non-empty result set back from the 
                     # SpyGlass, note the time and default to tracking. 
-                    self.sg.lastUpdate = datetime.utcnow()
+                    self.sg.lastUpdate = datetime.now()
                     if self.object_tracking:
                         self.nextLens = Outpost.Lens_TRACK
 
@@ -390,7 +391,7 @@ class Outpost:
                 # Fail safe kill switch, forced shutdown after 15 seconds. 
                 # TODO: Need above/below as configurable ruleset, event limit.
                 #  ----------------------------------------------------------
-                event_elapsed = datetime.utcnow() - self.event_start
+                event_elapsed = datetime.now() - self.event_start
                 if event_elapsed.seconds > 15:
                     self.status = Outpost.Status_QUIET
 

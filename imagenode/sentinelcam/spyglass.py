@@ -233,7 +233,7 @@ class Target:
 		self.rect = rect 
 		self.cent = cent 
 		self.source = source
-		self.upd = wen  # a datetime.utcnow() equivalent is expected here
+		self.upd = wen  # a datetime.now() equivalent is expected here
 	def toJSON(self) -> str:
 		return json.dumps({
 			'obj': self.objectID,
@@ -336,7 +336,7 @@ class SpyGlass:
         self.eventID = None
         self.view = view
         self.state = SpyGlass.State_BUSY
-        self.sgTime = datetime.utcnow()
+        self.sgTime = datetime.now()
         self.frametime = self.sgTime
         self.lastUpdate = self.sgTime
     
@@ -387,7 +387,7 @@ class SpyGlass:
 
     def new_event(self) -> dict:
         self.eventID = uuid.uuid1().hex
-        self.event_start = datetime.utcnow()
+        self.event_start = datetime.now()
         self._logdata = {'id': self.eventID, 'view': self.view, 'type': 'start', 'new': True}
         return self._logdata
 
@@ -423,7 +423,7 @@ class SpyGlass:
         # Too many edge cases around this approach. Not a robust solution. 
         newTarget = False
         interestingTargetFound = False
-        self.lastUpdate = datetime.utcnow()
+        self.lastUpdate = datetime.now()
         for i, (objectID, centroid) in enumerate(centroids.items()):
 
             # Ignore anything on the drop list
