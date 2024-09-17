@@ -1,24 +1,37 @@
-from datetime import datetime
+import os
+from time import time
 from collections import deque
+import yaml
 
 class FPS:
+    def __init__(self, history=160) -> None:  
+        self._deque = deque(maxlen=history)  # default allows for 5 seconds of history at 32 images/sec 
 
-	def __init__(self, history=160) -> None:  
-		# default allows for 5 seconds of history at 32 images/sec 
-		self._deque = deque(maxlen=history) 
+    def update(self) -> None:
+        # capture current timestamp
+        self._deque.append(time())
 
-	def lastStamp(self) -> datetime:
-		# return most recent timestamp, if any
-		return(self._deque[-1]) if len(self._deque) > 0 else None
+    def reset(self) -> None:
+        # restart the measurement
+        self._deque.clear()
 
-	def update(self) -> datetime:
-		# capture current timestamp, and return it
-		self._deque.append(datetime.utcnow())
-		return self.lastStamp()
-	
-	def fps(self) -> float:
-		# calculate and return estimated frames/sec
-		if len(self._deque) < 2:
-			return 0.0
-		else:
-			return len(self._deque) / (self._deque[-1] - self._deque[0]).total_seconds()
+    def fps(self) -> float:
+        # calculate and return current frames/sec
+        if len(self._deque) < 2:
+            return 0.0
+        else:
+            return (len(self._deque) / (self._deque[-1] - self._deque[0]))
+    
+    def get_min(self) -> int:
+        # return minute from the last timestamp
+        if len(self._deque) > 0:
+            return time.localtime(self._deque[-1]).tm_min
+        else:
+            return None
+
+def readConfig(path):
+	cfg = {}
+	if os.path.exists(path):
+		with open(path) as f:
+			cfg = yaml.safe_load(f)
+	return cfg
