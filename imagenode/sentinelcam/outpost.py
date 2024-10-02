@@ -324,7 +324,7 @@ class Outpost:
             targets = self.sg.get_count()
             logging.debug(f"Now tracking {targets} objects, tick {self._tick}, {Outpost.Status[self.status]}")
             if targets > 0:
-                if self.sg.get_state() == SpyGlass.State_BUSY:
+                if self.sg.get_state() == SpyGlass.State_BUSY or self.depthAI:
                     logtime = self._rate.lastStamp().isoformat()
                 else:
                     logtime = self.sg.get_frametime().isoformat()
