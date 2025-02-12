@@ -5,7 +5,7 @@ class PipelineFactory:
 
     def MobileNetSSD(self):
         NN_SIZE = (300,300)
-        NN_PATH = '/home/pi/depthai/depthai-python/examples/models/mobilenet-ssd_openvino_2021.4_6shave.blob'
+        NN_PATH = '/home/ops/imagenode/outpost/depthai/mobilenet-ssd_openvino_2021.4_8shave.blob'
 
         # Create pipeline
         pipeline = dai.Pipeline()
@@ -34,8 +34,10 @@ class PipelineFactory:
         cam.setFps(30)
         cam.setBoardSocket(dai.CameraBoardSocket.RGB)
         # scale collection down from 4K to just FullHD
-        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P) 
+        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
         cam.setVideoSize(640,360) # reduce further for storage
+        # For OAK-1 camera, when USB cable pointed down
+        cam.setImageOrientation(dai.CameraImageOrientation.ROTATE_180_DEG)
 
         encoder.setDefaultProfilePreset(1, dai.VideoEncoderProperties.Profile.MJPEG)
 
