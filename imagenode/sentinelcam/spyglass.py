@@ -4,7 +4,6 @@ Copyright (c) 2021 by Mark K Shumway, mark.shumway@swanriver.dev
 License: MIT, see the SentinelCam LICENSE for more details.
 """
 
-import os
 import json
 import logging
 import traceback
@@ -13,9 +12,8 @@ import cv2
 import numpy as np
 import multiprocessing
 from multiprocessing import sharedctypes
-from datetime import datetime
+from datetime import datetime, timedelta
 from time import sleep
-import dlib
 import imagezmq
 import msgpack
 import zmq
@@ -64,20 +62,21 @@ class LensTasking:
 
         elif lenstype == LensTasking.Request_TRACK:
             if cfg['tracker'] == 'dlib':
-                # This conditional is required for operation under OpenVINO, which
-                # does not include support for the legacy contributed trackers below
+                # This conditional might be required for operation under OpenVINO, or wherever
+                # support for the legacy contributed trackers was not deployed or is unavailable.
+                import dlib
                 return dlib.correlation_tracker()
             else:
                 # This dictionary maps strings to their corresponding (now
                 # legacy) OpenCV contributed object tracker implementations
                 OPENCV_OBJECT_TRACKERS = {
-                    "csrt": cv2.TrackerCSRT_create,
-                    "kcf": cv2.TrackerKCF_create,
-                    "boosting": cv2.TrackerBoosting_create,
-                    "mil": cv2.TrackerMIL_create,
-                    "tld": cv2.TrackerTLD_create,
-                    "medianflow": cv2.TrackerMedianFlow_create,
-                    "mosse": cv2.TrackerMOSSE_create
+                    "csrt": cv2.legacy.TrackerCSRT_create,
+                    "kcf": cv2.legacy.TrackerKCF_create,
+                    "boosting": cv2.legacy.TrackerBoosting_create,
+                    "mil": cv2.legacy.TrackerMIL_create,
+                    "tld": cv2.legacy.TrackerTLD_create,
+                    "medianflow": cv2.legacy.TrackerMedianFlow_create,
+                    "mosse": cv2.legacy.TrackerMOSSE_create
                 }
                 return OPENCV_OBJECT_TRACKERS[cfg["tracker"]]()
 
@@ -99,7 +98,7 @@ class LensTasking:
         if self._dlib:
             return []
         else:
-            return cv2.MultiTracker_create()
+            return cv2.legacy.MultiTracker_create()
     
     def _track_this(self, trkr, frame, x1, y1, x2, y2):
         if self._dlib:
@@ -203,7 +202,8 @@ class LensTasking:
             print("LensTasking failure.")
             traceback.print_exc()
         finally:
-            print(f"LensTasking ended with exceptionCount={exceptionCount}.")
+            #print(f"LensTasking ended with exceptionCount={exceptionCount}.")
+            print(f"LensTasking ended")
             outpost.close()
 
     def apply_lens(self, lens, frame) -> None:
@@ -222,30 +222,31 @@ class LensTasking:
             self.process.join()
 
 class Target:
-	def __init__(self, objid, classname, label ) -> None:
-		self.objectID = objid
-		self.rect = (0,0,0,0)
-		self.cent = (0,0)
-		self.classname = classname
-		self.source = 'lens'
-		self.text = label
-	def update_geo(self, rect, cent, source, wen) -> None:
-		self.rect = rect 
-		self.cent = cent 
-		self.source = source
-		self.upd = wen  # a datetime.now() equivalent is expected here
-	def toJSON(self) -> str:
-		return json.dumps({
-			'obj': self.objectID,
-			'rect': (int(self.rect[0]),int(self.rect[1]),int(self.rect[2]),int(self.rect[3])),
-			'cent': (int(self.cent[0]),int(self.cent[1])),
-			'clas': self.classname,
-			'src': self.source,
-			'tag': self.text,
-			'upd': self.upd.isoformat()
-		})
-	def toTrk(self) -> dict:
-		return {'obj': self.objectID,
+    def __init__(self, objid, classname, baseclass) -> None:
+        self.objectID = objid
+        self.rect = (0,0,0,0)
+        self.cent = (0,0)
+        self.classname = classname
+        self.baseclass = baseclass
+        self.source = 'lens'
+        self.text = "_".join([baseclass, str(objid)])
+    def update_geo(self, rect, cent, source, wen) -> None:
+        self.rect = rect 
+        self.cent = cent 
+        self.source = source
+        self.upd = wen  # a datetime.now() equivalent is expected here
+    def toJSON(self) -> str:
+        return json.dumps({
+            'obj': self.objectID,
+            'rect': (int(self.rect[0]),int(self.rect[1]),int(self.rect[2]),int(self.rect[3])),
+            'cent': (int(self.cent[0]),int(self.cent[1])),
+            'clas': self.classname,
+            'src': self.source,
+            'tag': self.text,
+            'upd': self.upd.isoformat()
+        })
+    def toTrk(self) -> dict:
+        return {'obj': self.objectID,
                 'clas': self.classname,
                 'rect': (int(self.rect[0]),int(self.rect[1]),int(self.rect[2]),int(self.rect[3]))
         }
@@ -327,6 +328,7 @@ class SpyGlass:
     State = ["SpyGlass is busy", "SpyGlass has result"]
 
     def __init__(self, view, camsize, cfg) -> None:
+        self.CFG = cfg
         self._tasking = LensTasking(camsize, cfg)
         self._motion = LensMotion()
         self._ct = CentroidTracker(maxDisappeared=3, maxDistance=100)  # TODO: add parms to config
@@ -339,6 +341,9 @@ class SpyGlass:
         self.sgTime = datetime.now()
         self.frametime = self.sgTime
         self.lastUpdate = self.sgTime
+        self.event_start = self.sgTime 
+        self.event_objects = set()
+        self.event_calls = 0
     
     def has_result(self) -> bool:
         if self._tasking.is_ready():
@@ -360,9 +365,10 @@ class SpyGlass:
     def apply_lens(self, lenstype, image, frametime) -> None:
         self._tasking.apply_lens(lenstype, image)
         self.sgTime = frametime
+        self.event_calls += 1
 
-    def new_target(self, item, classname, label) -> Target:
-        self._targets[item] = Target(item, classname, label)
+    def new_target(self, item, classname, baseclass) -> Target:
+        self._targets[item] = Target(item, classname, baseclass)
         return self._targets[item]
 
     def get_target(self, item) -> Target:
@@ -388,12 +394,23 @@ class SpyGlass:
     def new_event(self) -> dict:
         self.eventID = uuid.uuid1().hex
         self.event_start = datetime.now()
+        self.event_objects = set()
+        self.event_calls = 0
         self._logdata = {'id': self.eventID, 'view': self.view, 'type': 'start', 'new': True}
         return self._logdata
 
     def trackingLog(self, type) -> dict:
         self._logdata = {'id': self.eventID, 'view': self.view, 'type': type}
         return self._logdata
+    
+    def event_elapsed(self) -> timedelta:
+        return datetime.now() - self.event_start
+
+    def event_count(self) -> int:
+        return self.event_calls
+    
+    def target_summary(self) -> set:
+        return self.event_objects
 
     def terminate(self):
         self._tasking.terminate()
@@ -424,35 +441,60 @@ class SpyGlass:
         newTarget = False
         interestingTargetFound = False
         self.lastUpdate = datetime.now()
-        for i, (objectID, centroid) in enumerate(centroids.items()):
 
-            # Ignore anything on the drop list
-            if objectID in self._dropList:
-                continue
+        if self.CFG['tracker'] != "none":   # original tracking implementation has been deprecated
 
-            # Grab the SpyGlass target via its object ID
-            target = self.get_target(objectID)
+            for i, (objectID, centroid) in enumerate(centroids.items()):
 
-            # Create new targets for tracking as needed. 
-            if target is None:
+                # Ignore anything on the drop list
+                if objectID in self._dropList:
+                    continue
+
+                # Grab the SpyGlass target via its object ID
+                target = self.get_target(objectID)
+
+                # Create new targets for tracking as needed. 
+                if target is None:
+                    newTarget = True
+                    if labels and i<len(labels):
+                        classname = labels[i]
+                        baseclass = classname.split(':')[0]
+                    else:
+                        classname = baseclass = 'mystery'
+                    target = self.new_target(objectID, classname, baseclass)
+                    logging.debug(f"new_target({objectID}, {classname}, {baseclass})")
+
+                rect = rects[i] if i<len(rects) else (0,0,0,0)  # TODO: fix this stupid hack? (serves as a fail-safe)
+                target.update_geo(rect, centroid, lens, self.lastUpdate)
+                logging.debug(f"update_geo:{target.toJSON()}")
+        else:
+            self._targets = {}
+            for objid, (rect, classname) in enumerate(zip(rects, labels)):
                 newTarget = True
-                classname = labels[i].split(' ')[0][:-1] if labels and i < len(labels) else 'mystery'
-                targetText = "_".join([classname, str(objectID)])
-                target = self.new_target(objectID, classname, targetText)
+                baseclass = classname.split(':')[0]
+                target = self.new_target(objid, classname, baseclass)
+                (x1,y1,x2,y2) = rect
+                cX = int((x1 + x2) / 2.0)
+                cY = int((y1 + y2) / 2.0)
+                target.update_geo(rect, (cX, cY), lens, self.lastUpdate)
+                if target.baseclass == "person":
+                    interestingTargetFound = True
+                logging.debug(f"update_geo:{target.toJSON()}")
 
-            rect = rects[i] if i<len(rects) else (0,0,0,0)  # TODO: fix this stupid hack? (serves as a fail-safe)
-            target.update_geo(rect, centroid, lens, self.lastUpdate)
-            logging.debug(f"update_geo:{target.toJSON()}")
+        self.event_objects.update({t.baseclass for t in self.get_targets()})
 
-        for target in self.get_targets():
+        if self.CFG['tracker'] != "none":
 
-            # Drop vanished objects from SpyGlass 
-            if target.objectID not in self._ct.objects.keys():
-                logging.debug(f"Target {target.objectID} vanished")
-                self.drop_target(target.objectID)
+            for target in self.get_targets():
 
-            # when does it get interesting?
-            elif target.classname == "person":
-                interestingTargetFound = True
+                # Drop vanished objects from SpyGlass 
+                if target.objectID not in self._ct.objects.keys():
+                    logging.debug(f"Target {target.objectID} vanished")
+                    self.drop_target(target.objectID)
 
+                # when does it get interesting?
+                elif target.baseclass == "person":
+                    interestingTargetFound = True
+            
+        logging.debug(f"Target count {self.get_count()}, new={newTarget}, interested={interestingTargetFound}")
         return (newTarget, interestingTargetFound)

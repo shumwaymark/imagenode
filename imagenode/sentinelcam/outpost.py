@@ -6,19 +6,15 @@ License: MIT, see the sentinelcam LICENSE for more details.
 """
 
 import cv2
-import imutils
 import logging
+import logging.config
 import json
 import socket
-import sys
-import time
 import zmq
 import imagezmq
 import numpy as np
 import simplejpeg
 from ast import literal_eval
-from datetime import datetime
-from zmq.log.handlers import PUBHandler
 from sentinelcam.utils import FPS
 from sentinelcam.spyglass import SpyGlass
 
@@ -66,21 +62,22 @@ class Outpost:
         # configuration and setups
         self.cfg = config
         self.setups(config)
-        # when configured, start at most one instance each of log and image publishing
-        if self.publish_log:
-            if not Outpost.logger:
-                Outpost.logger = self.start_logPublisher(self.publish_log)
-        if self.publish_cam:
-            if not Outpost.publisher:
-                Outpost.publisher = imagezmq.ImageSender("tcp://*:{}".format(
-                    self.publish_cam), 
-                    REQ_REP=False)
+        # start at most one instance each of log and image publishing
+        if not Outpost.publisher:
+            Outpost.publisher = imagezmq.ImageSender("tcp://*:{}".format(
+                self.publish_cam), 
+                REQ_REP=False)
+        if not Outpost.logger:
+            logging.config.dictConfig(self.logconfig)
+            Outpost.logger = logging.getLogger()
+        # optional self-introduction to a running camwatcher
+        if self.camwatcher:
+            self.camwatcher_greeting()
         # setup CentroidTracker and SpyGlass tooling 
         self._rate = FPS()
         self.sg = SpyGlass(viewname, self.dimensions, self.cfg)
         self.status = Outpost.Status_INACTIVE
         self.nextLens = Outpost.Lens_MOTION
-        self.event_start = datetime.now()
         self._lastPublished = 0
         self._heartbeat = (0,0)
         self._noMotion = 0
@@ -90,32 +87,17 @@ class Outpost:
         if self.depthAI:
             self.setup_OAK(config["depthai"])
 
-    def start_logPublisher(self, publish):
-        log = logging.getLogger()
-        log.info('Activating log publisher on port {}'.format(publish))
-        zmq_log_handler = PUBHandler("tcp://*:{}".format(publish))
-        zmq_log_handler.setFormatter(logging.Formatter(fmt='{asctime}|{message}', style='{'))
-        zmq_log_handler.root_topic = self.nodename
-        log.addHandler(zmq_log_handler)
-        if self.camwatcher:
-            _host = socket.gethostname()
-            handoff = {'node': self.nodename, 
-                       'view': self.viewname, 
-                       'logger': f"tcp://{_host}:{self.publish_log}",
-                       'images': f"tcp://{_host}:{self.publish_cam}"}
-            msg = "CameraUp|" + json.dumps(handoff)
-            try:
-                with zmq.Context().instance().socket(zmq.REQ) as sock:
-                    log.debug('connecting to ' + self.camwatcher)
-                    sock.connect(self.camwatcher)
-                    sock.send(msg.encode("ascii"))
-            except Exception as e:
-                log.warning(f"Outpost.start_logPublisher(), Exception: {str(e)})")
-                log.setLevel(logging.WARNING)  # No event data logging supported
-            else:
-                log.handlers.remove(log.handlers[0]) # OK, all logging over PUB socket only
-                log.setLevel(logging.INFO)
-        return log
+    def camwatcher_greeting(self):
+        _host = socket.gethostname()
+        handoff = {'cmd': 'CamUp',
+                   'node': self.nodename, 
+                   'view': self.viewname, 
+                   'logger': f"tcp://{_host}:{self.publish_log}",
+                   'images': f"tcp://{_host}:{self.publish_cam}"}
+        msg = json.dumps(handoff)
+        with zmq.Context().instance().socket(zmq.REQ) as sock:
+            sock.connect(self.camwatcher)
+            sock.send(msg.encode("ascii"))
     
     def object_tracker(self, camera, image, send_q):
         """ Called as an imagnode Detector for each image in the pipeline.
@@ -133,19 +115,10 @@ class Outpost:
 
         """
         if self.publish_cam:
-            ns = time.time_ns()
             if self.encoder[0] == 'c':
-                # Try not to over-publish, estimate throttling based on expected frame rate
-                if (ns - self._lastPublished) > (1000000000 // camera.framerate):
-                    buffer = simplejpeg.encode_jpeg(image, 
-                        quality=camera.jpeg_quality, 
-                        colorspace='BGR')
-                    # TODO: Question: does the threshold above need to allow for image 
-                    # compression overhead? Asked for 32 FPS, getting about 24-25 per second 
-                    # for a (640,480) image size, within a pipeline velocity of 40-50 ticks/second.
-                    # Inexplicably, publishing rates seem to increase slightly as subscribers connect.
-                else:
-                    buffer = None
+                buffer = simplejpeg.encode_jpeg(image, 
+                    quality=camera.jpeg_quality, 
+                    colorspace='BGR')
             elif self.encoder[0] == 'o':
                 encFrameMsg = self.jpegQ.tryGet()
                 if encFrameMsg is not None:
@@ -159,11 +132,10 @@ class Outpost:
                 logging.error(f"JPEG only. Unsupported compression for image publishing '{self.encoder}', function disabled.") 
                     
             if buffer:
-                Outpost.publisher.send_jpg(camera.text, buffer)
-                self._lastPublished = ns
+                self._rate.update()
+                Outpost.publisher.send_jpg('|'.join([camera.text, self._rate.lastStamp().isoformat()]), buffer)
                 # Heartbeat message with current pipeline frame rates over the logger. 
                 # TODO: Make this a configurable setting. Currently every 5 minutes.
-                self._rate.update()
                 mm = self._rate.get_min()
                 if mm % 5 == 0 and mm != self._heartbeat[1]: 
                     tickrate = (self._tick - self._heartbeat[0]) / (5 * 60)
@@ -231,7 +203,7 @@ class Outpost:
                         labels.append("{}: {:.4f}".format(text, nnDet.confidence))
                         cnt += 1
                     if len(rects) > 0:
-                        newTarget, interested = self.sg.reviseTargetList(self.Lens, rects, labels)
+                        newTarget, interested = self.sg.reviseTargetList(lens, rects, labels)
                         if interested:
                             interestingTargetFound = True
             if cnt:
@@ -260,26 +232,17 @@ class Outpost:
 
                 # SpyGlass has results available, retrieve them now
                 (lens, rects, labels) = self.sg.get_data()
-                logging.debug(f"LensTasking lenstype {lens} result: {len(rects)} objects, tick {self._tick}")
+                logging.debug(f"LensTasking lenstype {lens}, result set is {len(rects)} objects, tick={self._tick}")
 
-                if self.nextLens == Outpost.Lens_RESET:
-                    # This is effectively a NOOP for the SpyGlass, clearing current results.
-                    # A lens command = 0 insures that the next result set will be empty. 
-                    self.nextLens = Outpost.Lens_MOTION
-                    rects = []
-                elif self.nextLens == Outpost.Lens_REDETECT:
-                    # If requested, clear results and apply a new lens.
+                if self.nextLens in [Outpost.Lens_RESET, Outpost.Lens_REDETECT]:
+                    # Based on the Outlook <-> SpyGlass protocol, any result set 
+                    # could be old, now very stale, and just received. In which case 
+                    # it's meaningless. So try to keep descision making in context.
+                    rects, labels = [],[]
                     self.nextLens = Outpost.Lens_DETECT
-                    rects = []
-
-                # Based on the Outlook <-> SpyGlass protocol, any result set 
-                # could be old, now very stale, and just received. In which case 
-                # it's meaningless. So try to keep descision making in context.
 
                 if len(rects) > 0:
-                    # Have a non-empty result set back from the 
-                    # SpyGlass, note the time and default to tracking. 
-                    self.sg.lastUpdate = datetime.now()
+                    # Have a non-empty result set back from the SpyGlass, default to tracking. 
                     if self.object_tracking:
                         self.nextLens = Outpost.Lens_TRACK
 
@@ -306,7 +269,7 @@ class Outpost:
 
                 # With current frame sent to the SpyGlass for analysis, there is now 
                 # time to work through the result set from the prior request, if any.
-                if self.spyGlassOnly and len(rects) > 0:
+                if len(rects) > 0:
                     newTarget, interestingTargetFound = self.sg.reviseTargetList(lens, rects, labels)
 
                 # To do this correctly, we need more CPU power. Ideally, detection and tracking
@@ -320,34 +283,29 @@ class Outpost:
                 # SpyGlass is busy. Skip this cycle and keep going. 
                 pass
 
-        if len(rects) > 0:  # New result set available. Begin event or continue logging as appropriate.
+        if len(rects) > 0 and (motionRect or self.status == Outpost.Status_ACTIVE):
+            # New result set available. Perform logging operations as appropriate.
             targets = self.sg.get_count()
             logging.debug(f"Now tracking {targets} objects, tick {self._tick}, {Outpost.Status[self.status]}")
             if targets > 0:
-                if self.sg.get_state() == SpyGlass.State_BUSY or self.depthAI:
-                    logtime = self._rate.lastStamp().isoformat()
-                else:
-                    logtime = self.sg.get_frametime().isoformat()
+                if self.sg.get_state() == SpyGlass.State_RESULT:
                     # This is the frame timestamp associated with the SpyGlass result set. Be careful
                     # if/when mixing with current result sets from a DepthAI pipeline. Logged data needs 
                     # to correspond to the frame timestamp associated with the image being reported.
-                    # TODO: Need consideration here for event start. If SpyGlass results are used as the
-                    # trigger to fire off a new event, the start of the image capture process will lag 
-                    # behind that initial result. A better solution: begin image capture when motion first
-                    # detected. If the SpyGlass comes up with nothing, end capture and delete empty event.
-                    # This requires careful fine-tuning of the motion detector to avoid unecessary system 
-                    # stress.
+                    logtime = self.sg.get_frametime().isoformat()
+                else:
+                    logtime = self._rate.lastStamp().isoformat()
+
                 if self.status != Outpost.Status_ACTIVE:
                     if self.motion_only or (newTarget and interestingTargetFound):
                         # This is a new event, begin logging the tracking data
                         self.status = Outpost.Status_ACTIVE
+                        self._evts += 1
                         ote = self.sg.new_event()
                         ote['fps'] = self._rate.fps()
                         ote['camsize'] = self.dimensions
                         ote['timestamp'] = logtime
                         logging.info(f"ote{json.dumps(ote)}")
-                        self.event_start = self.sg.event_start
-                        self._evts += 1
 
                 if self.status == Outpost.Status_ACTIVE:
                     # event in progress
@@ -358,6 +316,8 @@ class Outpost:
                             ote.update(target.toTrk())
                             logging.info(f"ote{json.dumps(ote)}")
 
+                # log.debug(“subtopic.subsub::the real message”) <-- ZMQ subtopic logging example
+
         # outpost tick count 
         self._tick += 1  
         if self._tick % self.skip_factor == 0: 
@@ -367,7 +327,7 @@ class Outpost:
             # an efficient way to gather metrics in-flight (something for the TODO list). 
             # As implemented, this is often out of phase from the surrounding logic, i.e. detection 
             # may have just completed. Formulating a one-size-fits-all solution is not simple. Much 
-            # depends on the field and depth of view. Cameras in close proximity to the subject ROI 
+            # depends on the field and depth of view. Cameras in close proximity to the subject  
             # need to be able to respond quickly to large changes in the images, such as when the 
             # subject is moving towards the camera. Correlation tracking may not even be effective
             # in these scenarios.
@@ -391,8 +351,7 @@ class Outpost:
                 # Fail safe kill switch, forced shutdown after 15 seconds. 
                 # TODO: Need above/below as configurable ruleset, event limit.
                 #  ----------------------------------------------------------
-                event_elapsed = datetime.now() - self.event_start
-                if event_elapsed.seconds > 15:
+                if self.sg.event_elapsed().seconds > 15:
                     self.status = Outpost.Status_QUIET
 
             if self.status == Outpost.Status_QUIET:
@@ -402,21 +361,22 @@ class Outpost:
                 runLogger = False
 
             if not runLogger:
-                logging.info(f"ote{json.dumps(self.sg.trackingLog('end'))}")
+                ote = self.sg.trackingLog('end')
+                ote['tasks'] = [(self.sentinel_tasks[o],1) for o in self.sg.event_objects if o in self.sentinel_tasks]
+                if 'default' in self.sentinel_tasks:
+                    ote['tasks'].append((self.sentinel_tasks['default'],2))
+                logging.info(f"ote{json.dumps(ote)}")
                 self.nextLens = Outpost.Lens_RESET
         
-        elif self.status == Outpost.Status_QUIET:
+        if self.status == Outpost.Status_QUIET:
             if self.sg.get_state() == SpyGlass.State_RESULT:
                 if len(rects) == 0 and self._noMotion > 3:
-                    self.sg.resetTargetList()
                     targets = 0
                 if targets == 0 or not interestingTargetFound:
                     logging.debug("Transition from quiet to inactive")
+                    self.sg.resetTargetList()
                     self.status = Outpost.Status_INACTIVE
-        else:
-            if targets > 0 and self.sg.get_state() == SpyGlass.State_RESULT and not interestingTargetFound:
-                self.sg.resetTargetList()
-                self.nextLens = Outpost.Lens_RESET
+                    self.nextLens = Outpost.Lens_RESET
 
     def setups(self, config) -> None:
         if 'camwatcher' in config:
@@ -445,9 +405,11 @@ class Outpost:
         if 'skip_factor' in config:
             self.skip_factor = config["skip_factor"]
         else:
-            self.skip_factor = 30
+            self.skip_factor = 13
         self.depthAI = 'depthai' in config
         self.spyGlassOnly = not self.depthAI
+        self.sentinel_tasks = config['sentinel_tasks']
+        self.logconfig = config['logconfig']
 
     def setup_OAK(self, config) -> None:
         from sentinelcam.oak_camera import PipelineFactory
