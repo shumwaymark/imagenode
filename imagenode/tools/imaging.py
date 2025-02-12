@@ -729,7 +729,7 @@ class Light:
 
 
 class PiCameraUnthreadedStream():
-    """ Rreads the PiCamera without threading.
+    """ Reads the PiCamera without threading.
 
     The PiVideoStream class within imutils.VideoStream provides a threaded way
     to read the PiCamera images. This class provides a way to read the PiCamera
@@ -737,30 +737,27 @@ class PiCameraUnthreadedStream():
     method names are the same as imutils.VideoStream.
     """
     def __init__(self, resolution=(320, 240), framerate=32, **kwargs):
-        from picamera.array import PiRGBArray
-        from picamera import PiCamera
-        self.camera = PiCamera()
-        self.camera.resolution = resolution
-        self.camera.framerate = framerate
-        self.rawCapture = PiRGBArray(self.camera, size=resolution)
-        self.stream = self.camera.capture_continuous(self.rawCapture,
-                                                     format="bgr",
-                                                     use_video_port=True)
+        from picamera2 import Picamera2
+        Picamera2.set_logging(Picamera2.INFO)
+        self.camera = Picamera2()
+        # setup the camera and start it
+        self.camera.still_configuration.main.size = resolution
+        self.camera.still_configuration.main.format = "RGB888"
+        self.camera.still_configuration.buffer_count = 2
+        self.camera.still_configuration.controls.FrameRate = framerate
+        self.camera.configure("still")
+        self.camera.start()
         self.frame = None
 
     def read(self):
-        f = next(self.stream)  # or f = self.stream.read()?
-        self.frame = f.array
-        self.rawCapture.truncate(0)
+        self.frame = self.camera.capture_array('main')
         return self.frame
 
     def stop(self):
         self.close()
 
     def close(self):
-        self.stream.close()
-        self.rawCapture.close()
-        self.camera.close()
+        None
 
 
 
