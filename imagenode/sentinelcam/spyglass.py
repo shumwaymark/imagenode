@@ -58,7 +58,8 @@ class LensTasking:
     def lens_factory(lenstype, cfg):
         if lenstype == LensTasking.Request_DETECT:
             detect = cfg["detectobjects"]
-            return LensTasking.OBJECT_DETECTORS[detect](cfg[detect])
+            accelerator = cfg.get("accelerator", "none")
+            return LensTasking.OBJECT_DETECTORS[detect](cfg[detect], accelerator=accelerator)
 
         elif lenstype == LensTasking.Request_TRACK:
             if cfg['tracker'] == 'dlib':
