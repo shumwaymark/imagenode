@@ -3,9 +3,9 @@ import depthai as dai
 
 class PipelineFactory:
 
-    def MobileNetSSD(self):
+    def MobileNetSSD(self, nn_path=None):
         NN_SIZE = (300,300)
-        NN_PATH = '/home/ops/imagenode/outpost/depthai/mobilenet-ssd_openvino_2021.4_8shave.blob'
+        NN_PATH = nn_path
 
         # Create pipeline
         pipeline = dai.Pipeline()
@@ -32,7 +32,7 @@ class PipelineFactory:
         cam.setInterleaved(False)
         cam.setIspScale(1,3)
         cam.setFps(30)
-        cam.setBoardSocket(dai.CameraBoardSocket.RGB)
+        cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
         # scale collection down from 4K to just FullHD
         cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
         cam.setVideoSize(640,360) # reduce further for storage
@@ -52,9 +52,9 @@ class PipelineFactory:
         device = dai.Device(pipeline)
         return device
 
-    def __init__(self, pipeline) -> None:
+    def __init__(self, pipeline, nn_path=None) -> None:
         logging.debug(f"Starting DepthAI pipeline '{pipeline}'")
         PipeLines = {
             'MobileNetSSD' : self.MobileNetSSD
         }
-        self.device = PipeLines[pipeline]()
+        self.device = PipeLines[pipeline](nn_path)
