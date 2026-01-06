@@ -33,10 +33,10 @@ class LensWire:
             return events[self._wire.zmq_socket] == zmq.POLLIN
         else:
             return False
-    
+
     def send(self, lenstype) -> None:
         self._send(msgpack.packb(lenstype))
-    
+
     def recv(self) -> tuple:
         return msgpack.unpackb(self._recv(), use_list=False)
 
@@ -100,7 +100,7 @@ class LensTasking:
             return []
         else:
             return cv2.legacy.MultiTracker_create()
-    
+
     def _track_this(self, trkr, frame, x1, y1, x2, y2):
         if self._dlib:
             # convert the frame from BGR to RGB for dlib
@@ -146,7 +146,7 @@ class LensTasking:
             outpost_send = outpost.zmq_socket.send
             outpost_recv = outpost.zmq_socket.recv
             outpost_send(msgpack.packb(0))  # handshake
-            
+
             if not cfg["detectobjects"] in ["none","motion"]:
                 od = LensTasking.lens_factory(LensTasking.Request_DETECT, cfg)
                 sleep(3.0)
@@ -156,18 +156,18 @@ class LensTasking:
                 self._doTracking = True
                 self._trkrs = self._trackers()
             print("LensTasking started.")
-            
+
             # Ignoring the first exception, just for a little dev sanity. See syslog for traceback.
-            while exceptionCount < LensTasking.FAIL_LIMIT:  
- 
+            while exceptionCount < LensTasking.FAIL_LIMIT:
+
                 # Task result is a tuple with the lens command, a list of rectangles, and a list of labels
                 result = (0, [], [])
-                try: 
+                try:
                     # wait on a lens command from the Outpost
                     lens = msgpack.unpackb(outpost_recv())
 
                     if lens == LensTasking.Request_DETECT:
-                        # Run object detection 
+                        # Run object detection
                         (rects, labels) = od.detect(frame)
                         rects_out = []
                         if self._doTracking:
@@ -179,11 +179,11 @@ class LensTasking:
                                 tracker = LensTasking.lens_factory(LensTasking.Request_TRACK, cfg)
                                 self._track_this(tracker, frame, x1, y1, x2, y2)
                         result = (lens, rects_out, labels)
-                
+
                     elif lens == LensTasking.Request_TRACK:
                         rects = self._update_trackers(frame)
                         result = (lens, rects, None)
-                    
+
                 except (KeyboardInterrupt, SystemExit):
                     print("LensTasking shutdown.")
                     exceptionCount = LensTasking.FAIL_LIMIT  # allow shutdown to continue
@@ -213,10 +213,10 @@ class LensTasking:
 
     def is_ready(self) -> bool:
         return self._wire.ready()
-    
+
     def get_result(self) -> tuple:
         return self._wire.recv()
-    
+
     def terminate(self) -> None:
         if self.process.is_alive():
             self.process.kill()
@@ -232,8 +232,8 @@ class Target:
         self.source = 'lens'
         self.text = "_".join([baseclass, str(objid)])
     def update_geo(self, rect, cent, source, wen) -> None:
-        self.rect = rect 
-        self.cent = cent 
+        self.rect = rect
+        self.cent = cent
         self.source = source
         self.upd = wen  # a datetime.now() equivalent is expected here
     def toJSON(self) -> str:
@@ -257,15 +257,15 @@ class SpyGlass:
     management scratchpad for tracking objects within the current view,
     and directing the image analysis pipeline in use.
 
-    A high-level wishlist of data collected for logging follows. Not all 
-    the below has been implemented. Parts of this should be delegated to 
+    A high-level wishlist of data collected for logging follows. Not all
+    the below has been implemented. Parts of this should be delegated to
     batch processing by the Sentinel.
 
     - state/status (active/inactive/quiet/changing)
     - timestamp of last actitivy
     - current or last event id
     - current lens (detect/track)
-    - objects tracked (aka Targets) 
+    - objects tracked (aka Targets)
         - object id as dictionary key
         - lens type (detectObjects/detectFaces/etc)
         - timestamp of last update
@@ -279,15 +279,15 @@ class SpyGlass:
         - confidence
         - label / text comment
         - color (for drawing rectangles on images)
-    
-    SpyGlass methods are primarly wrappers for LensTasking along with 
+
+    SpyGlass methods are primarly wrappers for LensTasking along with
     convenience access to the list of Targets.
 
     Internal use only, one instance per Outpost view.
 
     Parameters
     ----------
-    view : str  
+    view : str
         imagenode camera view name
     camsize : tuple
         image size (width, height) tuple
@@ -324,7 +324,7 @@ class SpyGlass:
         kill the LensTasking subprocess. Be courteous and call this as a part of imagenode shutdown
     """
     State_BUSY = 0
-    State_RESULT = 1 
+    State_RESULT = 1
 
     State = ["SpyGlass is busy", "SpyGlass has result"]
 
@@ -342,24 +342,26 @@ class SpyGlass:
         self.sgTime = datetime.now()
         self.frametime = self.sgTime
         self.lastUpdate = self.sgTime
-        self.event_start = self.sgTime 
+        self.event_start = self.sgTime
         self.event_objects = set()
         self.event_calls = 0
-    
+        # List of object classes that trigger event capture
+        self.interesting_objects = cfg.get('interesting_objects', ['person'])
+
     def has_result(self) -> bool:
         if self._tasking.is_ready():
             self.state = SpyGlass.State_RESULT
         else:
             self.state = SpyGlass.State_BUSY
         return self.state == SpyGlass.State_RESULT
-    
+
     def get_state(self) -> int:
         return self.state
-    
+
     def get_data(self) -> tuple:
         self.frametime = self.sgTime
         return self._tasking.get_result()
-    
+
     def get_frametime(self) -> datetime:
         return self.frametime
 
@@ -378,14 +380,14 @@ class SpyGlass:
     def update_target_geo(self, item, rect, cent, source, wen) -> None:
         if item in self._targets:
             self._targets[item].update_geo(rect, cent, source, wen)
-    
+
     def drop_target(self, item) -> None:
         if item in self._targets:
             del self._targets[item]
 
     def get_count(self) -> int:
         return len(self._targets)
-    
+
     def get_targets(self) -> list:
         return list(self._targets.values())
 
@@ -403,13 +405,13 @@ class SpyGlass:
     def trackingLog(self, type) -> dict:
         self._logdata = {'id': self.eventID, 'view': self.view, 'type': type}
         return self._logdata
-    
+
     def event_elapsed(self) -> timedelta:
         return datetime.now() - self.event_start
 
     def event_count(self) -> int:
         return self.event_calls
-    
+
     def target_summary(self) -> set:
         return self.event_objects
 
@@ -418,10 +420,10 @@ class SpyGlass:
 
     def __del__(self) -> None:
         self.terminate()
-    
+
     def resetTargetList(self):
         for target in self.get_targets():
-            self.drop_target(target.objectID)   
+            self.drop_target(target.objectID)
         trkdObjs = list(self._ct.objects.keys())
         for o in trkdObjs:
             self._ct.deregister(o)
@@ -429,16 +431,16 @@ class SpyGlass:
 
     def reviseTargetList(self, lens, rects, labels) -> tuple:
         # Centroid tracking algorithm courtesy of PyImageSearch.
-        # Using this to map tracked object centroids back to a  
+        # Using this to map tracked object centroids back to a
         # dictionary of targets managed by the SpyGlass
         centroids = self._ct.update(rects)
 
         # TODO: Need to validate CentroidTracker initilization and overall
         # fit within the context of the Outpost use cases. Specifically the
         # max disappeared limit. The real gap in thinking is likely the assumption
-        # that an ocurrence number from the list of rects provides for a reliable 
-        # mapping to objectID occurences coming out of the Centroid Tracker. 
-        # Too many edge cases around this approach. Not a robust solution. 
+        # that an ocurrence number from the list of rects provides for a reliable
+        # mapping to objectID occurences coming out of the Centroid Tracker.
+        # Too many edge cases around this approach. Not a robust solution.
         newTarget = False
         interestingTargetFound = False
         self.lastUpdate = datetime.now()
@@ -454,7 +456,7 @@ class SpyGlass:
                 # Grab the SpyGlass target via its object ID
                 target = self.get_target(objectID)
 
-                # Create new targets for tracking as needed. 
+                # Create new targets for tracking as needed.
                 if target is None:
                     newTarget = True
                     if labels and i<len(labels):
@@ -478,7 +480,7 @@ class SpyGlass:
                 cX = int((x1 + x2) / 2.0)
                 cY = int((y1 + y2) / 2.0)
                 target.update_geo(rect, (cX, cY), lens, self.lastUpdate)
-                if target.baseclass == "person":
+                if target.baseclass in self.interesting_objects:
                     interestingTargetFound = True
                 logging.debug(f"update_geo:{target.toJSON()}")
 
@@ -488,14 +490,14 @@ class SpyGlass:
 
             for target in self.get_targets():
 
-                # Drop vanished objects from SpyGlass 
+                # Drop vanished objects from SpyGlass
                 if target.objectID not in self._ct.objects.keys():
                     logging.debug(f"Target {target.objectID} vanished")
                     self.drop_target(target.objectID)
 
                 # when does it get interesting?
-                elif target.baseclass == "person":
+                elif target.baseclass in self.interesting_objects:
                     interestingTargetFound = True
-            
+
         logging.debug(f"Target count {self.get_count()}, new={newTarget}, interested={interestingTargetFound}")
         return (newTarget, interestingTargetFound)
