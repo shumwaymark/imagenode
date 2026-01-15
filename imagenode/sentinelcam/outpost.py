@@ -143,7 +143,7 @@ class Outpost:
                     self._heartbeat = (self._tick, mm)
 
         rects = []                      # fresh start here, no determinations made
-        targets = self.sg.get_count()   # number of ojects tracked by the SpyGlass
+        targets = self.sg.get_count()   # number of objects tracked by the SpyGlass
         interestingTargetFound = False  # only begin event capture when interested
         newTarget = False               # flag indicates new target entered field of view
 
@@ -152,12 +152,10 @@ class Outpost:
         x1, y1 = self.detector.top_left
         x2, y2 = self.detector.bottom_right
         ROI = image[y1:y2, x1:x2]
-        # convert to grayscale and smoothen using gaussian kernel
-        gray = cv2.cvtColor(ROI, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        # Motion detection. This returns an aggregate
-        # rectangle of the estimated area of motion.
+        # Convert to grayscale and apply motion detection to the region of interest.
+        # This returns an aggregate rectangle of the estimated area of motion.
         lens = Outpost.Lens_MOTION
+        gray = cv2.cvtColor(ROI, cv2.COLOR_BGR2GRAY)
         motionRect = self.sg.detect_motion(gray)
         if motionRect:
             self._noMotion = 0

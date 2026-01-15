@@ -74,13 +74,37 @@ class ParseYOLOOutput:
         return (boxes, confidences, classIDs)
 
 class LensMotion:
-    def __init__(self) -> None:
-        # TODO: add threshold and history length as configuration items
-        self.mog = cv2.createBackgroundSubtractorMOG2(varThreshold=128, detectShadows=False)
+    def __init__(self, motion_params=None) -> None:
+        # Use provided params or fall back to hardcoded defaults
+        # motion_params can contain: varThreshold, detectShadows, history,
+        # minContourW, minContourH, gaussianBlur, noMotionThreshold
+        if motion_params:
+            varThreshold = motion_params.get('varThreshold', 128)
+            detectShadows = motion_params.get('detectShadows', False)
+            history = motion_params.get('history', 500)
+            self.minContourW = motion_params.get('minContourW', 50)
+            self.minContourH = motion_params.get('minContourH', 50)
+            self.gaussianBlur = motion_params.get('gaussianBlur', 5)
+        else:
+            # Hardcoded defaults (original behavior)
+            varThreshold = 128
+            detectShadows = False
+            history = 500
+            self.minContourW = 50
+            self.minContourH = 50
+            self.gaussianBlur = 5
+
+        self.mog = cv2.createBackgroundSubtractorMOG2(
+            varThreshold=varThreshold,
+            detectShadows=detectShadows,
+            history=history)
 
     def detect(self, image) -> tuple:
-        # apply the MOG background subtraction model
-        mask = self.mog.apply(image)
+        # Apply gaussian blur for noise reduction (configurable kernel size)
+        blurred = cv2.GaussianBlur(image, (self.gaussianBlur, self.gaussianBlur), 0)
+
+        # Apply the MOG background subtraction model
+        mask = self.mog.apply(blurred)
         cnts = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = imutils.grab_contours(cnts)
         (minX, minY) = (image.shape[1], image.shape[0])
@@ -95,7 +119,7 @@ class LensMotion:
             # compute the bounding box of the contour and use it to
             # update the minimum and maximum bounding box of the region
             (x, y, w, h) = cv2.boundingRect(c)
-            if w>50 and h>50:  # apply a size threshold for noise suppression TODO: config item?
+            if w >= self.minContourW and h >= self.minContourH:
                 (minX, minY) = (min(minX, x), min(minY, y))
                 (maxX, maxY) = (max(maxX, x + w), max(maxY, y + h))
 

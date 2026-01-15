@@ -331,7 +331,8 @@ class SpyGlass:
     def __init__(self, view, camsize, cfg) -> None:
         self.CFG = cfg
         self._tasking = LensTasking(camsize, cfg)
-        self._motion = LensMotion()
+        # Pass motion_params from config if available
+        self._motion = LensMotion(cfg.get('motion_params'))
         self._ct = CentroidTracker(maxDisappeared=3, maxDistance=100)  # TODO: add parms to config
         self._dropList = {}  # unwanted objects
         self._targets = {}   # dictionary of Targets by objectID
