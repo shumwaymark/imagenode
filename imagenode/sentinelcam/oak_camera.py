@@ -573,7 +573,7 @@ def build_pipeline(
 
     archive = dai.NNArchive(nn_archive)
     nn = pipeline.create(dai.node.DetectionNetwork)
-    nn.setNNArchive(archive, numShaves=6)
+    nn.setNNArchive(archive, numShaves=6)  # type: ignore[call-arg]  # numShaves overload present at runtime but missing from depthai 3.5 pybind11 stub
     nn.setConfidenceThreshold(detection_confidence)
     nn.setNumInferenceThreads(2)
     nn.input.setBlocking(False)
@@ -686,21 +686,26 @@ class OakCamera:
     def running(self) -> Optional[RunningPipeline]:
         return self._running
 
+    def _require_running(self) -> RunningPipeline:
+        if self._running is None:
+            raise RuntimeError("OakCamera.start() must be called before accessing output queues")
+        return self._running
+
     @property
     def q_jpeg(self):
-        return self._running.q_jpeg
+        return self._require_running().q_jpeg
 
     @property
     def q_det(self):
-        return self._running.q_det
+        return self._require_running().q_det
 
     @property
     def q_crops(self):
-        return self._running.q_crops
+        return self._require_running().q_crops
 
     @property
     def q_meta(self):
-        return self._running.q_meta
+        return self._require_running().q_meta
 
     def close(self) -> None:
         if self._running is not None:
@@ -715,59 +720,21 @@ class OakCamera:
 # ===========================================================================
 
 class PipelineFactory:
+    """Retired DepthAI v2 pipeline factory — stub retained for import compatibility.
 
-    def MobileNetSSD(self, nn_path=None):
-        NN_SIZE = (300,300)
-        NN_PATH = nn_path
-
-        # Create pipeline
-        pipeline = dai.Pipeline()
-
-        # Define nodes and outputs
-        nn = pipeline.create(dai.node.MobileNetDetectionNetwork)
-        cam = pipeline.create(dai.node.ColorCamera)
-        encoder = pipeline.create(dai.node.VideoEncoder)
-
-        xoutFrames = pipeline.create(dai.node.XLinkOut)
-        xoutJPEG = pipeline.create(dai.node.XLinkOut)
-        xoutNN = pipeline.create(dai.node.XLinkOut)
-
-        xoutFrames.setStreamName("frames")
-        xoutJPEG.setStreamName("jpegs")
-        xoutNN.setStreamName("nn")
-
-        # Properties
-        nn.setConfidenceThreshold(0.5)
-        nn.setBlobPath(NN_PATH)
-
-        cam.setPreviewSize(NN_SIZE)
-        cam.setPreviewKeepAspectRatio(False)
-        cam.setInterleaved(False)
-        cam.setIspScale(1,3)
-        cam.setFps(30)
-        cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-        # scale collection down from 4K to just FullHD
-        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        cam.setVideoSize(640,360) # reduce further for storage
-        # For OAK-1 camera, when USB cable pointed down
-        cam.setImageOrientation(dai.CameraImageOrientation.ROTATE_180_DEG)
-
-        encoder.setDefaultProfilePreset(1, dai.VideoEncoderProperties.Profile.MJPEG)
-
-        # Linking
-        cam.video.link(encoder.input)
-        cam.video.link(xoutFrames.input)
-        encoder.bitstream.link(xoutJPEG.input)
-        cam.preview.link(nn.input)
-        nn.out.link(xoutNN.input)
-
-        # Connect to device and start pipeline
-        device = dai.Device(pipeline)
-        return device
+    The original ``MobileNetSSD`` builder targeted the DepthAI v2 node API
+    (``ColorCamera``, ``XLinkOut``), which no longer exists under depthai>=3.5.
+    The v2 and v3 node APIs are mutually exclusive within a single installed
+    ``depthai`` package, so this module cannot host both working paths. The live
+    OAK path is now ``OakCamera`` / ``build_pipeline`` (redesign Phase 2);
+    ``outpost.py`` is rewired to ``OakCamera`` in Phase 4. Until then this stub
+    stands in for the old entry point and fails loudly rather than silently
+    constructing a broken v2 pipeline against a v3 install.
+    """
 
     def __init__(self, pipeline, nn_path=None) -> None:
-        logging.debug(f"Starting DepthAI pipeline '{pipeline}'")
-        PipeLines = {
-            'MobileNetSSD' : self.MobileNetSSD
-        }
-        self.device = PipeLines[pipeline](nn_path)
+        raise NotImplementedError(
+            "The DepthAI v2 PipelineFactory is retired (depthai>=3.5 removed the "
+            "v2 node API). Use OakCamera (Pipeline A2) for the v3 path; outpost "
+            "integration lands in redesign Phase 4."
+        )
