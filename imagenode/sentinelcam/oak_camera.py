@@ -66,6 +66,16 @@ them away, re-read the livetest log each is anchored to.
   4. DO NOT warm up cold ImageManip state at startup with synthetic emits.
      Two warmups 4ms apart killed the device immediately (livetest9). The
      first real detection-driven emit warms the warp engine in normal use.
+
+  5. The crop ImageManip must consume ONE CONFIG PER IMAGE. By default it holds
+     a standing config and applies it to whatever image arrives next, so config
+     trails image by one emit — every crop is cropped with the PREVIOUS emit's
+     config (region offset; wrong output dims across class boundaries; ~every
+     crop swapped under multi-subject coexistence). Set inputConfig
+     setReusePreviousMessage(False) + setWaitForMessage(True). Independent of
+     Script send order (Phase 2.5 maniplag probe: 100% lagged both orders, 100%
+     aligned with the levers; validated 0 mismatches / 6407 crops / 150 multi-
+     detection frames). Applies to any ImageManip driven by per-frame configs.
 ===============================================================================
 
 DepthAI v3.x. Uses Camera.build(socket) + requestOutput() pattern.
@@ -476,7 +486,7 @@ while True:
         # RunningPipeline).
         #
         # The intrinsic config lag this was once suspected to influence is fixed
-        # on the manip's inputConfig (Rule 6 in build_pipeline), not here: the
+        # on the manip's inputConfig (Rule 5 in build_pipeline), not here: the
         # maniplag probe proved send order is irrelevant (100% lagged under BOTH
         # orders without the inputConfig levers, 100% aligned with them). cfg
         # before img is kept only because that was the order in the validated
@@ -632,7 +642,7 @@ def build_pipeline(
         vehicle_profile.width * vehicle_profile.height,
     ) * 3
     #
-    # Rule 6: one config PER image on inputConfig. By default the ImageManip
+    # Rule 5: one config PER image on inputConfig. By default the ImageManip
     # holds a standing config and applies it to whatever image arrives next, so
     # config trails image by one emit — every crop is cropped with the PREVIOUS
     # emit's config (region offset; dims wrong when the class changes between
