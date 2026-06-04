@@ -239,6 +239,7 @@ def _build_script_source(
     vehicle_indices: set,
     frame_width: int = 1920,
     frame_height: int = 1080,
+    debug_emits: bool = False,
 ) -> str:
     """Build the on-device Script body (runs inside the DepthAI Script node).
 
@@ -248,7 +249,22 @@ def _build_script_source(
     Per-class stage-1 throttle uses Clock.now() seconds + IoU(last emit bbox).
     Emits a metadata Buffer for every crop on the crop_meta output, sent
     BEFORE cfg+img so the meta queue can never lag the crops queue.
+
+    `debug_emits` (default False) gates a per-emit `node.warn` instrument that
+    prints class/seqnum/det_idx/crop-geometry/confidence for EVERY emit. Off in
+    production (it floods the log under traffic); turn on to trace what the
+    device is cropping and where. See build_pipeline's `debug_emits` arg.
     """
+    # Built verbatim into the Script body, so braces here are runtime str.format
+    # placeholders (single braces), not f-string interpolation.
+    if debug_emits:
+        debug_warn = (
+            'node.warn("emit cls={} seq={} det={} px=({},{})+{}x{} out={}x{} '
+            'conf={:.2f}".format(class_key, frame_seq, det_idx, x_px, y_px, '
+            'w_px, h_px, out_w, out_h, float(det.confidence)))'
+        )
+    else:
+        debug_warn = "pass  # emit debug disabled (build_pipeline debug_emits=False)"
     return f"""
 import struct
 
@@ -451,22 +467,24 @@ while True:
         cfg.addCrop(x_px, y_px, w_px, h_px)
         cfg.setOutputSize(out_w, out_h, ImageManipConfig.ResizeMode.STRETCH)
 
-        # Single dispatch — host demuxes by meta.label. Person emits get a
-        # warn because they're rare and historically associated with warp
-        # hangs; vehicle emits don't (too noisy under normal traffic).
-        if is_person:
-            node.warn(
-                "person_emit seq={{}} det={{}} bbox=({{:.3f}},{{:.3f}},{{:.3f}},{{:.3f}}) "
-                "crop_px=({{}},{{}})+{{}}x{{}} out={{}}x{{}} conf={{:.2f}}".format(
-                    frame_seq, det_idx,
-                    xmin, ymin, xmax, ymax,
-                    x_px, y_px, w_px, h_px,
-                    out_w, out_h, float(det.confidence),
-                )
-            )
+        # Per-emit debug instrument — gated by build_pipeline(debug_emits=...).
+        # Emits nothing in production; when enabled, warns on EVERY emit (all
+        # classes) so the device's crop decisions can be traced live.
+        {debug_warn}
+        # meta FIRST — keeps the meta queue from ever lagging the crops queue
+        # (host pairs crop->meta and must find the meta already queued; see
+        # RunningPipeline).
+        #
+        # The intrinsic config lag this was once suspected to influence is fixed
+        # on the manip's inputConfig (Rule 6 in build_pipeline), not here: the
+        # maniplag probe proved send order is irrelevant (100% lagged under BOTH
+        # orders without the inputConfig levers, 100% aligned with them). cfg
+        # before img is kept only because that was the order in the validated
+        # run; with setWaitForMessage(True) on inputConfig the order no longer
+        # matters.
         node.io['crop_meta'].send(meta)
-        node.io['crop_img'].send(frame)
         node.io['crop_cfg'].send(cfg)
+        node.io['crop_img'].send(frame)
 """
 
 
@@ -529,6 +547,7 @@ def build_pipeline(
     rotate_180: bool = True,
     person_profile: CropProfile = DEFAULT_PERSON_PROFILE,
     vehicle_profile: CropProfile = DEFAULT_VEHICLE_PROFILE,
+    debug_emits: bool = False,
 ) -> PipelineOutputs:
     """Assemble Pipeline A2. Lifted verbatim from oak_benchmark/pipeline_a2.py.
 
@@ -588,6 +607,7 @@ def build_pipeline(
             vehicle_indices=VEHICLE_LABEL_INDICES,
             frame_width=1920,
             frame_height=1080,
+            debug_emits=debug_emits,
         )
     )
     nn.out.link(script.inputs["detections"])
@@ -611,10 +631,23 @@ def build_pipeline(
         person_profile.width * person_profile.height,
         vehicle_profile.width * vehicle_profile.height,
     ) * 3
+    #
+    # Rule 6: one config PER image on inputConfig. By default the ImageManip
+    # holds a standing config and applies it to whatever image arrives next, so
+    # config trails image by one emit — every crop is cropped with the PREVIOUS
+    # emit's config (region offset; dims wrong when the class changes between
+    # emits). Confirmed on hardware 2026-06-03 with the oak_harness maniplag
+    # probe: 100% lagged under BOTH send orders (so send order is irrelevant),
+    # and 100% aligned once these two levers force a strict one-config-per-image
+    # pairing. setWaitForMessage makes the manip wait for a config for each image;
+    # setReusePreviousMessage(False) stops it reusing the standing one. Both were
+    # applied together in the validated run — keep them together.
     crop_manip = pipeline.create(dai.node.ImageManip)
     crop_manip.setMaxOutputFrameSize(max_crop_bytes)
     crop_manip.inputImage.setBlocking(False)
     crop_manip.inputConfig.setBlocking(False)
+    crop_manip.inputConfig.setReusePreviousMessage(False)
+    crop_manip.inputConfig.setWaitForMessage(True)
     script.outputs["crop_cfg"].link(crop_manip.inputConfig)
     script.outputs["crop_img"].link(crop_manip.inputImage)
 
