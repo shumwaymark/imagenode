@@ -10,11 +10,14 @@ import logging
 import logging.config
 import json
 import socket
+import threading
+import time
 import zmq
 import imagezmq
 import numpy as np
 import simplejpeg
 from ast import literal_eval
+from datetime import datetime
 from sentinelcam.utils import FPS
 from sentinelcam.spyglass import SpyGlass
 
@@ -31,8 +34,10 @@ class Outpost:
     """
 
     logger = None     # ZeroMQ async log publisher
-    publisher = None  # image publishing over imageZMQ
-    oakCameras = {}   # OAK camera image queues, keyed by viewname
+    # Process-wide singletons, created once in __init__ before any use. Typed
+    # non-Optional (with an ignored None seed) so member access doesn't trip the
+    # type checker on this initialize-once pattern.
+    publisher: "imagezmq.ImageSender" = None  # type: ignore[assignment]  # image publishing over imageZMQ
 
     Status_INACTIVE = 0
     Status_QUIET = 1
@@ -88,6 +93,8 @@ class Outpost:
             self.setup_OAK(config["depthai"])
 
     def camwatcher_greeting(self):
+        # only called when self.camwatcher is a configured connection string (truthy)
+        assert isinstance(self.camwatcher, str)
         _host = socket.gethostname()
         handoff = {'cmd': 'CamUp',
                    'node': self.nodename,
@@ -114,17 +121,17 @@ class Outpost:
                             to the imagehub for Librarian processing
 
         """
+        if self.depthAI:
+            # OAK path: the event plane runs on its own threads (setup_OAK). This
+            # callback is a keepalive — heartbeat only, no per-frame work here.
+            self._oak_keepalive()
+            return
+
         if self.publish_cam:
             if self.encoder[0] == 'c':
                 buffer = simplejpeg.encode_jpeg(image,
                     quality=camera.jpeg_quality,
                     colorspace='BGR')
-            elif self.encoder[0] == 'o':
-                encFrameMsg = self.jpegQ.tryGet()
-                if encFrameMsg is not None:
-                    buffer = bytearray(encFrameMsg.getData())
-                else:
-                    buffer = None
             else:
                 # TODO add support for uncompressed, and video formats
                 buffer = None
@@ -173,40 +180,6 @@ class Outpost:
                         self.nextLens = Outpost.Lens_DETECT
         else:
             self._noMotion += 1
-
-        if self.depthAI:
-            # When running DepthAI on an OAK camera, pull down any neural net results now.
-            # SpyGlass can provide for optional supplemental analysis, append any such results afterwards.
-            cnt = 0
-            lens = Outpost.Lens_depthAI
-            imageSeqThreshold = camera.cam.getImgFrame().getSequenceNum()
-            normVals = np.full(4, self.dimensions[1])
-            normVals[::2] = self.dimensions[0]
-            for net in self.nnQs:
-                # multiple neural nets may be used in parallel
-                for nnMsg in net.tryGetAll():
-                    # Each message relates to a single image, and can contain multiple results. For this
-                    # initial shakedown, no assumptions regarding synchronization to the current frame are
-                    # implemented. This should be OK, as long as the content of each queue is closely aligned.
-                    nnSeq = nnMsg.getSequenceNum()
-                    if nnSeq > imageSeqThreshold:
-                        logging.debug(f"ImgDetection sequence {nnSeq}, ImgFrame sequence {imageSeqThreshold}")
-                    rects, labels = [],[]
-                    for nnDet in nnMsg.detections:
-                        text = Outpost.MobileNetSSD_labels[nnDet.label]
-                        logging.debug(f"nnDet[{cnt}] image {nnSeq}, {text}, look {self._looks}")
-                        # normalize detection result bounding boxes to frame dimensioms
-                        bbox = np.array([nnDet.xmin, nnDet.ymin, nnDet.xmax, nnDet.ymax])
-                        rects.append((np.clip(bbox, 0, 1) * normVals).astype(int))
-                        labels.append("{}: {:.4f}".format(text, nnDet.confidence))
-                        cnt += 1
-                    if len(rects) > 0:
-                        newTarget, interested = self.sg.reviseTargetList(lens, rects, labels)
-                        if interested:
-                            interestingTargetFound = True
-            if cnt:
-                # TODO: might want to apply a special lens to the SpyGlass?
-                self.nextLens = Outpost.Lens_MOTION
 
         if self.spyGlassOnly and (motionRect or self.status == Outpost.Status_ACTIVE):
             # ----------------------------------------------------------------------------------------
@@ -410,23 +383,171 @@ class Outpost:
         self.logconfig = config['logconfig']
 
     def setup_OAK(self, config) -> None:
-        from sentinelcam.oak_camera import PipelineFactory
-        self.oak = PipelineFactory(config["pipeline"], config["model"]).device
-        self.frameQ = self.oak.getOutputQueue(name=config["images"], maxSize=4, blocking=False)
-        self.jpegQ = self.oak.getOutputQueue(name=config["jpegs"], maxSize=4, blocking=False)
-        self.nnQs = []
-        for net in config['neural_nets'].values():
-            self.nnQs.append(self.oak.getOutputQueue(name=net, maxSize=4, blocking=False))
-            logging.debug(f"DepthAI neural net queue '{net}' opened")
-        Outpost.oakCameras[self.viewname] = self.frameQ
+        """Build and start the redesigned OAK event plane (Phase 3/4).
+
+        Replaces the retired DepthAI v2 PipelineFactory path. Constructs the
+        Phase-2 device pipeline (one NN Archive, four host queues) and the
+        in-process event plane — persistent tracker, event manager, EventSampler
+        — then starts the two threads that own the device: the Plane-1
+        ScenePublisher (q_jpeg -> scene PUB, always on) and the Plane-2
+        OutpostIntake drain (det/meta/crops -> tracker/events/sampler). From here
+        the imagenode detector callback is a keepalive (see object_tracker).
+        """
+        from sentinelcam.oak_camera import (OakCamera, CropMeta, classify_detection,
+                                            MOBILENET_LABELS)
+        from sentinelcam.hosttracker import HostTracker, TrackerConfig
+        from sentinelcam.eventmanager import EventManager
+        from sentinelcam.eventsampler import EventSampler, LateralTraversalStrategy
+        from sentinelcam.outpost_intake import OutpostIntake, ScenePublisher, CropLookback
+
+        oak_cfg = config.get("oak_pipeline", {})
+        self._crop_quality = int(oak_cfg.get("jpeg_quality", 90))
+        # Scene publication size produced by oak_camera.build_pipeline (768x432).
+        # Keep in sync with that requestOutput; trk rects denormalize against it.
+        scene_size = (768, 432)
+
+        # Shared device->wall clock state. The scene publisher (Plane 1) and the
+        # event manager / sampler (Plane 2) BOTH stamp records via _oak_clock(ct)
+        # off the SAME per-frame device capture-time, so image[N] and trk/crp[N]
+        # carry an identical timestamp string (exact-match correlation downstream:
+        # camwatcher image naming, VehicleSpeed timestamp_to_offset, overlays).
+        self._oak_t0_wall = None
+        self._oak_t0_dev = None
+        self._oak_clock_lock = threading.Lock()
+
+        # Phase-2 device pipeline: one NN Archive, four host output queues.
+        self._oak = OakCamera(config["nn_archive"], oak_cfg)
+        run = self._oak.start()
+
+        # Persistent tracker + event manager (host_tracker_design.md).
+        tracker = HostTracker(TrackerConfig.from_dict(config.get("tracker")))
+        events = EventManager(
+            self.viewname, scene_size,
+            sentinel_tasks=self.sentinel_tasks,
+            emit=logging.getLogger().info,
+            timestamp_fn=self._oak_clock,        # maps device capture-time ct -> wall ISO
+        )
+
+        # Crop lookback holds device frames directly (poolhold-confirmed safe, §3.3).
+        lookback = CropLookback(maxlen=int(config.get("lookback_frames", 90)))
+
+        # Plane-2 crop publisher: a SECOND ImageZMQ socket, crop stream only (§4.4).
+        self._crop_pub = imagezmq.ImageSender(
+            "tcp://*:{}".format(config["crop_publish"]), REQ_REP=False)
+
+        sampler = EventSampler(
+            self.viewname, tracker, lookback,
+            encode_crop=self._encode_crop,
+            publish_crop=lambda text, jpg: self._crop_pub.send_jpg(text, jpg),
+            emit_ote=logging.getLogger().info,
+            spyglass_offer=None,            # TODO Phase 4.6: repurposed LensTasking crop inference
+            strategy=LateralTraversalStrategy(),
+            timestamp_fn=self._oak_clock,    # same device->wall clock as scene + trk
+        )
+
+        # Plane-1 scene publisher (always on, 24x7) over the shared image sender.
+        # Stamps each frame from ITS device capture-time via the shared clock, so
+        # the image timestamp matches the trk/crp timestamp for the same frame.
+        scene = ScenePublisher(
+            run.q_jpeg,
+            lambda seq, dev_s, jpg: Outpost.publisher.send_jpg(
+                "|".join([' '.join([self.nodename, self.viewname]).strip(),
+                          'jpg', self._oak_clock(dev_s)]), jpg),
+        )
+
+        # Plane-2 drain thread (owns det/meta/crops).
+        intake = OutpostIntake(
+            run, tracker, events, sampler, lookback,
+            classify=classify_detection,
+            decode_meta=CropMeta.unpack,
+            # specific MobileNet-SSD label name for the trk record (car/bus/train/…)
+            label_name=lambda i: MOBILENET_LABELS[i] if 0 <= i < len(MOBILENET_LABELS) else str(i),
+        )
+
+        scene.start()
+        intake.start()
+        self._oak_tracker = tracker
+        self._oak_events = events
+        self._oak_intake = intake
+        self._oak_scene = scene
+        self._oak_t0 = time.monotonic()
+        self._oak_last_hb = 0.0
+        logging.info(
+            f"OAK event plane started: view={self.viewname} "
+            f"scene=:{self.publish_cam} crops=:{config['crop_publish']}")
+
+    def _oak_clock(self, dev_seconds: float) -> str:
+        """ISO timestamp for OAK OTE/scene records.
+
+        Maps the device capture-time (`dev_seconds` = ImgFrame.getTimestamp()
+        .total_seconds(), a monotonic device epoch) to wall-clock, anchoring the
+        offset ONCE on the first frame seen (anti-pattern #5: capture-time, not
+        per-call now()). Scene, trk, and crp all route through here off the same
+        per-frame `dev_seconds`, so the same camera frame yields an IDENTICAL
+        timestamp string across streams — required for exact-match correlation
+        (camwatcher image naming, VehicleSpeed timestamp_to_offset, overlays).
+
+        Note: relies on the scene and detection requestOutputs carrying the same
+        device timestamp for a given source frame (same capture, propagated
+        seqnum). If hardware ever shows them diverging, switch the anchor key to
+        the seqnum (guaranteed identical across streams).
+        """
+        if self._oak_t0_wall is None:
+            with self._oak_clock_lock:
+                if self._oak_t0_wall is None:
+                    self._oak_t0_wall = time.time()
+                    self._oak_t0_dev = dev_seconds
+        return datetime.fromtimestamp(
+            self._oak_t0_wall + (dev_seconds - self._oak_t0_dev)).isoformat()
+
+    def _encode_crop(self, frame) -> bytes:
+        """NV12 device crop -> JPEG. DepthAI v3 cannot hardware-encode dynamic
+        crop sizes, so the selected crops are host-encoded (§4.3)."""
+        nv12 = frame.getFrame()
+        bgr = cv2.cvtColor(nv12, cv2.COLOR_YUV2BGR_NV12)
+        return simplejpeg.encode_jpeg(bgr, quality=self._crop_quality, colorspace="BGR")
+
+    def _oak_keepalive(self) -> None:
+        """Heartbeat for the OAK detector callback. The event plane runs on its
+        own threads; this only emits the periodic fps() heartbeat. Cadence is set
+        by OAKcamera.read() pacing the imagenode loop."""
+        self._tick += 1
+        now = time.monotonic()
+        if now - self._oak_last_hb >= 300:          # every 5 minutes
+            elapsed = now - self._oak_t0
+            scene_fps = self._oak_scene.published / elapsed if elapsed > 0 else 0.0
+            st = self._oak_intake.stats()
+            logging.info(
+                f"fps({self._oak_scene.published}, {st['dets_seen']}, "
+                f"{self._oak_events.events_opened}, {scene_fps:.2f}, {scene_fps:.2f})")
+            self._oak_last_hb = now
 
 class OAKcamera:
+    """Keepalive camera shim for an OAK outpost (redesign Phase 3/4).
+
+    In the redesigned OAK path the device output queues are owned by the event
+    plane (the OutpostIntake drain thread + ScenePublisher started in
+    ``Outpost.setup_OAK``), NOT by the imagenode camera loop. But imagenode's
+    main loop (``while not send_q: read_cameras()``) still calls ``read()`` once
+    per iteration and is paced ONLY by that call blocking. So this shim does no
+    device I/O: it sleeps a fixed cadence to keep the loop off a hot spin and
+    returns a tiny placeholder frame. ``Outpost.object_tracker`` is a keepalive
+    on the OAK path and ignores the returned image.
+
+    The OAK node's camera YAML must NOT set ``vflip``/``resize_width`` (frame
+    geometry is handled on-device, e.g. ``oak_pipeline.rotate_180``); the
+    framework would otherwise transform this placeholder needlessly.
+    """
+
+    _PACE_S = 0.05                       # ~20 Hz housekeeping; real 30 fps work is on the threads
+    _PLACEHOLDER = np.zeros((4, 4, 3), dtype=np.uint8)
+
     def __init__(self, view) -> None:
+        self.view = view
         self.frame = None
-        self.frame_q = Outpost.oakCameras[view]
     def read(self) -> object:
-        self.frame = self.frame_q.get()
-        return self.frame.getCvFrame()
+        time.sleep(self._PACE_S)         # pace the imagenode loop without touching the device
+        return OAKcamera._PLACEHOLDER
     def getImgFrame(self) -> object:
         return self.frame
     def stop(self) -> None:
