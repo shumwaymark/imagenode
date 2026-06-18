@@ -91,6 +91,8 @@ class Outpost:
         self._evts = 0
         if self.depthAI:
             self.setup_OAK(config["depthai"])
+        elif self.picamTracker:
+            self.setup_picamera(config)
 
     def camwatcher_greeting(self):
         # only called when self.camwatcher is a configured connection string (truthy)
@@ -164,6 +166,14 @@ class Outpost:
         lens = Outpost.Lens_MOTION
         gray = cv2.cvtColor(ROI, cv2.COLOR_BGR2GRAY)
         motionRect = self.sg.detect_motion(gray)
+
+        if self.picamTracker:
+            # §4.10 unified lifecycle: the persistent host tracker owns events.
+            # The legacy cascade / scene-management / status machine below is bypassed.
+            self._picam_object_tracker(image, motionRect)
+            self._tick += 1
+            return
+
         if motionRect:
             self._noMotion = 0
             # motion-only mode provides for the capture and logging
@@ -349,6 +359,59 @@ class Outpost:
                     self.status = Outpost.Status_INACTIVE
                     self.nextLens = Outpost.Lens_RESET
 
+    def setup_picamera(self, config) -> None:
+        """§4.10 picamera unified lifecycle. Build the source-agnostic event plane —
+        a persistent HostTracker + EventManager — driven from object_tracker via the
+        PicameraIntake adapter. SpyGlass is demoted to a DETECT-only inference engine;
+        motion (run every frame) schedules the inferences (the NN-scheduler role)."""
+        from sentinelcam.hosttracker import HostTracker, TrackerConfig
+        from sentinelcam.eventmanager import EventManager
+        from sentinelcam.picamera_intake import PicameraIntake
+
+        VEHICLE = {"car", "truck", "bus", "motorbike", "motorcycle", "bicycle", "train"}
+
+        def classify(name):
+            if name == "person":
+                return "person"
+            if name in VEHICLE:
+                return "vehicle"
+            return None                          # not interesting — dropped at ingest
+
+        tracker = HostTracker(TrackerConfig.from_dict(config.get("tracker")))
+        events = EventManager(
+            self.viewname, self.dimensions,
+            sentinel_tasks=self.sentinel_tasks,
+            emit=logging.getLogger().info,
+            timestamp_fn=lambda ct: datetime.fromtimestamp(ct).isoformat(),
+        )
+        self._picam_tracker = tracker
+        self._picam_events = events
+        self._picam_intake = PicameraIntake(
+            self.viewname, self.dimensions, tracker, events, classify)
+        logging.info(f"Picamera event plane ready (host tracker, view {self.viewname})")
+
+    def _picam_object_tracker(self, image, motionRect) -> None:
+        """§4.10 per-frame event plane. Motion schedules SpyGlass DETECT inferences;
+        results drive the HostTracker via observe(); quiet frames advance it with
+        tick(). Exactly one SpyGlass request is in flight (REQ/REP): every recv
+        (get_data) is paired with a send (apply_lens). While quiet and idle the
+        pending result lingers unconsumed — pairing intact — until motion resumes."""
+        ct = self._rate.lastStamp().timestamp()
+        active = self._picam_events.event_open or self._picam_tracker.has_active()
+        consumed = False
+        if motionRect or active:
+            if self.sg.has_result():
+                (lens, rects, labels) = self.sg.get_data()            # the owed recv
+                self.sg.apply_lens(Outpost.Lens_DETECT, image,        # paired send (re-prime)
+                                   self._rate.lastStamp())
+                self._picam_intake.observe(ct, rects, labels)
+                self._looks += 1
+                consumed = True
+            # else: inference in flight — do nothing, keep the REQ/REP pairing intact
+        if not consumed:
+            self._picam_intake.tick(ct)
+        self._evts = self._picam_events.events_opened
+
     def setups(self, config) -> None:
         if 'camwatcher' in config:
             self.camwatcher = config['camwatcher']
@@ -371,7 +434,10 @@ class Outpost:
         else:
             self.encoder = 'cpu'
         self.object_detection = config["detectobjects"]
-        self.object_tracking = config["tracker"] != "none"
+        # Legacy correlation-tracking on/off flag is a STRING ('none'/'dlib'/cv2 name).
+        # The §4.10 path carries a host-tracker config DICT here instead, which is not
+        # a legacy flag — so object_tracking is False for it.
+        self.object_tracking = isinstance(config.get("tracker"), str) and config["tracker"] != "none"
         self.motion_only = self.object_detection == "motion"
         if 'skip_factor' in config:
             self.skip_factor = config["skip_factor"]
@@ -379,6 +445,10 @@ class Outpost:
             self.skip_factor = 13
         self.depthAI = 'depthai' in config
         self.spyGlassOnly = not self.depthAI
+        # §4.10 picamera unified lifecycle: opt in by giving detector.tracker a dict
+        # (the host-tracker config). Not for OAK (own event plane) or motion_only.
+        self.picamTracker = (not self.depthAI and not self.motion_only
+                             and isinstance(config.get("tracker"), dict))
         self.sentinel_tasks = config['sentinel_tasks']
         self.logconfig = config['logconfig']
 

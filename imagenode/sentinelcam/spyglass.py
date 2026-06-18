@@ -150,7 +150,12 @@ class LensTasking:
             if not cfg["detectobjects"] in ["none","motion"]:
                 od = LensTasking.lens_factory(LensTasking.Request_DETECT, cfg)
                 sleep(3.0)
-            if cfg['tracker'] == "none":
+            # Correlation tracking only for an explicit legacy tracker name
+            # ('dlib' or a cv2 tracker). The §4.10 picamera path carries the
+            # host-tracker config as a DICT under detector.tracker, which means
+            # "no correlation tracking here" — SpyGlass is DETECT-only and the
+            # persistent HostTracker owns tracking.
+            if not isinstance(cfg['tracker'], str) or cfg['tracker'] == "none":
                 self._doTracking = False
             else:
                 self._doTracking = True
