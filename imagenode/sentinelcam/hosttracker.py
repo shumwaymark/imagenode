@@ -44,6 +44,11 @@ Transition = tuple[int, str, str]            # (tid, from_state, to_state)
 class TrackerConfig:
     interesting_classes: frozenset = frozenset({"person", "vehicle"})
     match_iou: float = 0.30          # detection<->track association floor
+    min_confidence_new: float = 0.0  # admission floor: a detection below this may still
+                                     #    associate/sustain an existing track, but must NOT
+                                     #    BIRTH a new one (ByteTrack high/low split, §12.1).
+                                     #    Kills low-confidence static-blob storms at the birth
+                                     #    site. 0.0 = replay-identical (no gating).
     confirm_obs: int = 2             # min sightings to confirm PROVISIONAL->ACTIVE
     confirm_time: float = 0.05       # AND min capture-time span (s)
     quiescence_window: float = 1.2   # s of no relocation -> QUIESCENT
@@ -51,6 +56,13 @@ class TrackerConfig:
     relocation_iou: float = 0.50     # banked-vs-now IoU below this == "relocated" -> re-open
     gap_misses: Optional[int] = 30   # K: max consecutive observe()-misses before END
                                      #    (None = never end; analysis pass A only)
+    quiescent_gap_misses: Optional[int] = None
+                                     # coast K for QUIESCENT (banked) tracks. A parked subject
+                                     #    survives this many consecutive misses before END, so a
+                                     #    brief detection dropout (glare/focus blink) re-associates
+                                     #    at its banked bbox instead of ending + re-opening a fresh
+                                     #    event (§6/§12.1). Set well above gap_misses. None = fall
+                                     #    back to gap_misses (replay-identical).
     history_len: int = 256           # bounded per-track (ts, bbox) history depth
     # §12.3 open item — centroid-distance association fallback for the IoU=0 tail
     # (fastest movers / re-detect jumps). None = DISABLED = replay-identical default.
@@ -173,9 +185,13 @@ class HostTracker:
     # -- the authoritative path (ported verbatim from the validated replay) -- #
 
     def observe(self, capture_time: float, detections) -> list[Transition]:
-        """The NN ran. `detections` is an iterable of (baseclass, bbox), bbox
-        normalized (x1,y1,x2,y2). Returns the transitions this frame produced.
-        Interesting-class filtering is applied here (host_tracker §3)."""
+        """The NN ran. `detections` is an iterable of (baseclass, bbox[, label[, conf]]):
+        bbox normalized (x1,y1,x2,y2); optional `label` is the display string
+        ("car: 0.96"); optional `conf` is the numeric detection confidence consulted by
+        the admission floor (`min_confidence_new`). When `conf` is absent it defaults to
+        1.0 (unknown == unfiltered), keeping the 2-/3-tuple replay corpus identical.
+        Returns the transitions this frame produced. Interesting-class filtering is
+        applied here (host_tracker §3)."""
         cfg = self.cfg
         ts = capture_time
         # dets stays a 2-tuple list so the validated association logic is unchanged;
@@ -183,12 +199,14 @@ class HostTracker:
         # label (3rd detection element, e.g. "car: 0.96"), default = baseclass.
         dets = []
         labels = []
+        confs = []
         for _d in detections:
             c, b = _d[0], _d[1]
             if c not in cfg.interesting_classes:
                 continue
             dets.append((c, tuple(b)))
             labels.append(_d[2] if len(_d) > 2 else c)
+            confs.append(_d[3] if len(_d) > 3 else 1.0)
 
         # greedy IoU association within class
         pairs = []
@@ -244,21 +262,30 @@ class HostTracker:
 
         transitions: list[Transition] = []
 
-        # unmatched dets -> new provisional tracks
+        # unmatched dets -> new provisional tracks, gated by admission confidence.
+        # A sub-floor detection already had its chance to associate above (sustain);
+        # it must not BIRTH a track (ByteTrack high/low split, §12.1).
         for di, (cls, bb) in enumerate(dets):
-            if di not in used_d:
+            if di not in used_d and confs[di] >= cfg.min_confidence_new:
                 self._new(cls, bb, ts, labels[di])
 
-        # unmatched tracks accrue misses; END past K
+        # unmatched tracks accrue misses; END past K. QUIESCENT (banked) tracks coast
+        # on a larger K (quiescent_gap_misses) so a brief dropout — glare/focus blink —
+        # doesn't END + re-open a still-present parked subject (§6/§12.1). gap_misses
+        # is None still means "never end" for every state (analysis pass A).
         survivors = []
         for t in self.tracks:
             if t.tid not in used_t:
                 t.misses += 1
-                if cfg.gap_misses is not None and t.misses > cfg.gap_misses:
-                    if t.state != PROVISIONAL:
-                        transitions.append((t.tid, t.state, END))
-                    self._leave_quiescent(t, t.last_observed)
-                    continue                        # drop
+                if cfg.gap_misses is not None:
+                    K = cfg.gap_misses
+                    if t.state == QUIESCENT and cfg.quiescent_gap_misses is not None:
+                        K = cfg.quiescent_gap_misses
+                    if t.misses > K:
+                        if t.state != PROVISIONAL:
+                            transitions.append((t.tid, t.state, END))
+                        self._leave_quiescent(t, t.last_observed)
+                        continue                    # drop
             survivors.append(t)
         self.tracks = survivors
 

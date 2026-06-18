@@ -96,11 +96,14 @@ class RunningPipelineLike(Protocol):
 Transition = tuple[int, str, str]                # (tid, from_state, to_state)
 
 
-# A detection fed to the tracker: (baseclass, bbox), bbox normalized (x1,y1,x2,y2).
-# MUST be a 2-tuple — HostTracker.observe() unpacks each as `(c, b)`. A dataclass
-# is not unpackable and crashes observe() on the first non-empty frame (the silent
-# drain-thread death that looked like "live feed but no events", fixed 2026-06-08).
-Detection = tuple[str, tuple]
+# A detection fed to the tracker: (baseclass, bbox[, label[, conf]]); bbox normalized
+# (x1,y1,x2,y2). The optional 3rd element is the display label ("car: 0.9600"); the
+# optional 4th is the numeric confidence consulted by the tracker's admission floor
+# (min_confidence_new). MUST be a positional tuple — HostTracker.observe() unpacks each
+# as `(c, b)` and indexes `_d[2]`/`_d[3]`. A dataclass is not unpackable and crashes
+# observe() on the first non-empty frame (the silent drain-thread death that looked
+# like "live feed but no events", fixed 2026-06-08).
+Detection = tuple
 
 
 class Tracker(Protocol):
@@ -337,14 +340,17 @@ class OutpostIntake(threading.Thread):
             if base is None:                     # not an interesting class — drop at ingest
                 continue
             bbox = (float(x.xmin), float(x.ymin), float(x.xmax), float(x.ymax))
-            # 3rd element: specific label + confidence ("car: 0.9600"), legacy
-            # format that downstream (VehicleSpeed, overlays) parse. The tracker
-            # uses base for identity and carries this through to the trk record.
+            conf = float(x.confidence)
+            # 3rd element: specific label + confidence ("car: 0.9600"), legacy format
+            # that downstream (VehicleSpeed, overlays) parse. 4th: numeric confidence
+            # for the tracker's admission floor (min_confidence_new) — without it the
+            # floor sees the 1.0 default and never gates. The tracker uses base for
+            # identity and carries the label through to the trk record.
             if self._label_name is not None:
-                label = f"{self._label_name(int(x.label))}: {float(x.confidence):.4f}"
-                out.append((base, bbox, label))
+                label = f"{self._label_name(int(x.label))}: {conf:.4f}"
+                out.append((base, bbox, label, conf))
             else:
-                out.append((base, bbox))         # baseclass-only (picamera default)
+                out.append((base, bbox, base, conf))   # baseclass label, conf carried
         return out
 
     def stats(self) -> dict:
