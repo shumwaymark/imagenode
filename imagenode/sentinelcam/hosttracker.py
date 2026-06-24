@@ -130,11 +130,11 @@ class Track:
         self.state = PROVISIONAL
         self.obs = 1
         self.misses = 0
-        self.banked_bbox = None                     # bbox at QUIESCENT entry (relocation ref)
+        self.banked_bbox: Optional[tuple] = None    # bbox at QUIESCENT entry (relocation ref)
         self.history = deque([(capture_time, bbox)], maxlen=history_len)
         self.went_active = False
-        self.q_enter = None                         # ts entered QUIESCENT (banked-duration acct)
-        self.event_id = None                        # stamped by the event manager; tracker ignores
+        self.q_enter: Optional[float] = None        # ts entered QUIESCENT (banked-duration acct)
+        self.event_id: Optional[str] = None         # stamped by the event manager; tracker ignores
 
 
 class HostTracker:

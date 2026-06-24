@@ -1,23 +1,28 @@
 """spyglass: A concurrent image analysis pipeline for the SentinelCam Outpost
 
+Since the §4.10 closeout the SpyGlass is a DETECT-only inference engine: it runs
+motion detection (the NN scheduler) and a single object-detection lens in a
+non-blocking child process over a single-frame shared-memory buffer. Object
+identity, tracking, and event lifecycle live in the persistent host-side tracker
+(hosttracker.py) + event manager (eventmanager.py), NOT here. The legacy
+correlation-tracking cascade (dlib/cv2 trackers, CentroidTracker, the Target /
+new_event / trackingLog scene-management surface) was retired in §4.10.
+
 Copyright (c) 2021 by Mark K Shumway, mark.shumway@swanriver.dev
 License: MIT, see the SentinelCam LICENSE for more details.
 """
 
-import json
-import logging
 import traceback
-import uuid
 import cv2
 import numpy as np
 import multiprocessing
 from multiprocessing import sharedctypes
-from datetime import datetime, timedelta
+from datetime import datetime
 from time import sleep
 import imagezmq
 import msgpack
 import zmq
-from sentinelcam.lenses import LensMotion, LensYOLOv3, LensMobileNetSSD, CentroidTracker
+from sentinelcam.lenses import LensMotion, LensYOLOv3, LensMobileNetSSD
 
 class LensWire:
     def __init__(self, ipcname) -> None:
@@ -49,41 +54,19 @@ class LensTasking:
     LENS_WIRE = "/tmp/SpyGlass306"
 
     Request_DETECT = 1
-    Request_TRACK = 2
 
     OBJECT_DETECTORS = {
         'yolov3'       : LensYOLOv3,
         'mobilenetssd' : LensMobileNetSSD
     }
+    @staticmethod
     def lens_factory(lenstype, cfg):
         if lenstype == LensTasking.Request_DETECT:
             detect = cfg["detectobjects"]
             accelerator = cfg.get("accelerator", "none")
             return LensTasking.OBJECT_DETECTORS[detect](cfg[detect], accelerator=accelerator)
 
-        elif lenstype == LensTasking.Request_TRACK:
-            if cfg['tracker'] == 'dlib':
-                # This conditional might be required for operation under OpenVINO, or wherever
-                # support for the legacy contributed trackers was not deployed or is unavailable.
-                import dlib
-                return dlib.correlation_tracker()
-            else:
-                # This dictionary maps strings to their corresponding (now
-                # legacy) OpenCV contributed object tracker implementations
-                OPENCV_OBJECT_TRACKERS = {
-                    "csrt": cv2.legacy.TrackerCSRT_create,
-                    "kcf": cv2.legacy.TrackerKCF_create,
-                    "boosting": cv2.legacy.TrackerBoosting_create,
-                    "mil": cv2.legacy.TrackerMIL_create,
-                    "tld": cv2.legacy.TrackerTLD_create,
-                    "medianflow": cv2.legacy.TrackerMedianFlow_create,
-                    "mosse": cv2.legacy.TrackerMOSSE_create
-                }
-                return OPENCV_OBJECT_TRACKERS[cfg["tracker"]]()
-
     def __init__(self, camsize, cfg) -> None:
-        self._dlib = cfg['tracker'] == 'dlib'
-        self._trkrs = None
         dtype = np.dtype('uint8')
         shape = (camsize[1], camsize[0], 3)
         self._frameBuffer = sharedctypes.RawArray('c', shape[0]*shape[1]*shape[2])
@@ -93,52 +76,11 @@ class LensTasking:
         self.process.start()
         handshake = self._wire.recv()  # wait on handshake from subprocess
         self._sharedFrame = np.frombuffer(self._frameBuffer, dtype=dtype).reshape(shape)
-        self._wire.send(handshake)  # send it right back to prime the pmup
-
-    def _trackers(self):
-        if self._dlib:
-            return []
-        else:
-            return cv2.legacy.MultiTracker_create()
-
-    def _track_this(self, trkr, frame, x1, y1, x2, y2):
-        if self._dlib:
-            # convert the frame from BGR to RGB for dlib
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rect = dlib.rectangle(x1, y1, x2, y2)
-            trkr.start_track(rgb, rect)
-            self._trkrs.append(trkr)
-        else:
-            self._trkrs.add(trkr, frame, (x1, y1, x2-x1, y2-y1))
-
-    def _update_trackers(self, frame):
-        rects = []
-        if self._dlib:
-            # convert the frame from BGR to RGB for dlib
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # loop over the trackers
-            for tracker in self._trkrs:
-                # update the tracker and grab the updated position
-                tracker.update(rgb)
-                pos = tracker.get_position()
-                # unpack the position object
-                startX = int(pos.left())
-                startY = int(pos.top())
-                endX = int(pos.right())
-                endY = int(pos.bottom())
-                # add the bounding box coordinates to the rectangles list
-                rects.append((startX, startY, endX, endY))
-        else:
-            # Update object trackers
-            (success, boxes) = self._trkrs.update(frame)
-            # Loop over the bounding boxes and convert to an (x1, y1, x2, y2) list
-            for box in boxes:
-                (x, y, w, h) = [int(v) for v in box]
-                rects.append((x, y, x+w, y+h))
-        # return results
-        return rects
+        self._wire.send(handshake)  # send it right back to prime the pump
 
     def _taskLoop(self, framebuff, dtype, shape, cfg):
+        outpost = None
+        od = None
         try:
             exceptionCount = 0
             frame = np.frombuffer(framebuff, dtype=dtype).reshape(shape)
@@ -150,44 +92,22 @@ class LensTasking:
             if not cfg["detectobjects"] in ["none","motion"]:
                 od = LensTasking.lens_factory(LensTasking.Request_DETECT, cfg)
                 sleep(3.0)
-            # Correlation tracking only for an explicit legacy tracker name
-            # ('dlib' or a cv2 tracker). The §4.10 picamera path carries the
-            # host-tracker config as a DICT under detector.tracker, which means
-            # "no correlation tracking here" — SpyGlass is DETECT-only and the
-            # persistent HostTracker owns tracking.
-            if not isinstance(cfg['tracker'], str) or cfg['tracker'] == "none":
-                self._doTracking = False
-            else:
-                self._doTracking = True
-                self._trkrs = self._trackers()
             print("LensTasking started.")
 
             # Ignoring the first exception, just for a little dev sanity. See syslog for traceback.
             while exceptionCount < LensTasking.FAIL_LIMIT:
 
-                # Task result is a tuple with the lens command, a list of rectangles, and a list of labels
-                result = (0, [], [])
+                # Task result is a tuple: the lens command and a list of structured
+                # detections, each (class_name, (x1,y1,x2,y2), confidence). The host
+                # tracker owns identity/tracking, so SpyGlass only ever runs DETECT.
+                result = (0, [])
                 try:
                     # wait on a lens command from the Outpost
                     lens = msgpack.unpackb(outpost_recv())
 
-                    if lens == LensTasking.Request_DETECT:
-                        # Run object detection
-                        (rects, labels) = od.detect(frame)
-                        rects_out = []
-                        if self._doTracking:
-                            # Populate new trackers with objects found, if any
-                            self._trkrs = self._trackers()
-                        for (x1, y1, x2, y2) in rects:
-                            rects_out.append((int(x1), int(y1), int(x2), int(y2)))
-                            if self._doTracking:
-                                tracker = LensTasking.lens_factory(LensTasking.Request_TRACK, cfg)
-                                self._track_this(tracker, frame, x1, y1, x2, y2)
-                        result = (lens, rects_out, labels)
-
-                    elif lens == LensTasking.Request_TRACK:
-                        rects = self._update_trackers(frame)
-                        result = (lens, rects, None)
+                    if lens == LensTasking.Request_DETECT and od is not None:
+                        # Run object detection -> structured detection list
+                        result = (lens, od.detect(frame))
 
                 except (KeyboardInterrupt, SystemExit):
                     print("LensTasking shutdown.")
@@ -208,9 +128,9 @@ class LensTasking:
             print("LensTasking failure.")
             traceback.print_exc()
         finally:
-            #print(f"LensTasking ended with exceptionCount={exceptionCount}.")
             print(f"LensTasking ended")
-            outpost.close()
+            if outpost is not None:
+                outpost.close()
 
     def apply_lens(self, lens, frame) -> None:
         self._sharedFrame[:] = frame[:]  # np.copyto(self._sharedFrame, frame)
@@ -227,66 +147,13 @@ class LensTasking:
             self.process.kill()
             self.process.join()
 
-class Target:
-    def __init__(self, objid, classname, baseclass) -> None:
-        self.objectID = objid
-        self.rect = (0,0,0,0)
-        self.cent = (0,0)
-        self.classname = classname
-        self.baseclass = baseclass
-        self.source = 'lens'
-        self.text = "_".join([baseclass, str(objid)])
-    def update_geo(self, rect, cent, source, wen) -> None:
-        self.rect = rect
-        self.cent = cent
-        self.source = source
-        self.upd = wen  # a datetime.now() equivalent is expected here
-    def toJSON(self) -> str:
-        return json.dumps({
-            'obj': self.objectID,
-            'rect': (int(self.rect[0]),int(self.rect[1]),int(self.rect[2]),int(self.rect[3])),
-            'cent': (int(self.cent[0]),int(self.cent[1])),
-            'clas': self.classname,
-            'src': self.source,
-            'tag': self.text,
-            'upd': self.upd.isoformat()
-        })
-    def toTrk(self) -> dict:
-        return {'obj': self.objectID,
-                'clas': self.classname,
-                'rect': (int(self.rect[0]),int(self.rect[1]),int(self.rect[2]),int(self.rect[3]))
-        }
-
 class SpyGlass:
-    """ The SpyGlass is a construct conceieved as an event and state
-    management scratchpad for tracking objects within the current view,
-    and directing the image analysis pipeline in use.
+    """ A DETECT-only inference engine for the SentinelCam Outpost.
 
-    A high-level wishlist of data collected for logging follows. Not all
-    the below has been implemented. Parts of this should be delegated to
-    batch processing by the Sentinel.
-
-    - state/status (active/inactive/quiet/changing)
-    - timestamp of last actitivy
-    - current or last event id
-    - current lens (detect/track)
-    - objects tracked (aka Targets)
-        - object id as dictionary key
-        - lens type (detectObjects/detectFaces/etc)
-        - timestamp of last update
-        - source of update (lens/tracker/dropped)
-        - bounding rectangle within the view
-        - Z-coordinate(s) within the view
-        - geometric centroid within view
-        - status? (still, vanished, in motion / direction of travel, velocity?)
-        - classification
-        - identification
-        - confidence
-        - label / text comment
-        - color (for drawing rectangles on images)
-
-    SpyGlass methods are primarly wrappers for LensTasking along with
-    convenience access to the list of Targets.
+    The SpyGlass wraps LensTasking (the forked detection child process) with
+    motion detection and convenience access to the single-frame analysis IPC.
+    Identity, tracking, and event lifecycle are owned by the persistent
+    host-side tracker + event manager (§4.10), not by the SpyGlass.
 
     Internal use only, one instance per Outpost view.
 
@@ -302,31 +169,17 @@ class SpyGlass:
     Methods
     -------
     has_result() -> bool
-        spyglass has results avalable
-    get_data() - > tuple
-        retrieve results from spyglass
-    apply_lens(lenstype, frame) -> None
+        spyglass has results available
+    get_data() -> tuple
+        retrieve (lens, detections) from spyglass
+    apply_lens(lenstype, image, frametime) -> None
         send frame to spyglass for analysis, with lens type to use
-    new_target(objid, rect, classname, label) -> Target
-        create a new trackable target
-	get_target(objid) -> Target
-		return spyglass target by object ID
-    drop_target(objid) -> None
-        delete a tracked object by object ID
-    update_target_geo(objid, rect, cent, source, datetime) -> None
-        update the tracking coordinates for a target by ID, with source of data
-    get_count() -> int
-        return total number of targets being tracked
-	get_targets() -> list
-		return list of targets being tracked
-    detect_motion(image) -> list
-        return a rectangle for aggregate area of motion from background subtraction model
-    new_event() -> dict
-        indicate start of new event and return dictionary with logging information
-    trackingLog(type) -> dict
-        return current event logging record dictionary for specifed type ['trk','end']
+    detect_motion(image) -> tuple
+        return a rectangle for the aggregate area of motion from the
+        background subtraction model
     terminate() -> None
-        kill the LensTasking subprocess. Be courteous and call this as a part of imagenode shutdown
+        kill the LensTasking subprocess. Be courteous and call this as a
+        part of imagenode shutdown
     """
     State_BUSY = 0
     State_RESULT = 1
@@ -338,21 +191,10 @@ class SpyGlass:
         self._tasking = LensTasking(camsize, cfg)
         # Pass motion_params from config if available
         self._motion = LensMotion(cfg.get('motion_params'))
-        self._ct = CentroidTracker(maxDisappeared=3, maxDistance=100)  # TODO: add parms to config
-        self._dropList = {}  # unwanted objects
-        self._targets = {}   # dictionary of Targets by objectID
-        self._logdata = {}   # tracking event data for logging
-        self.eventID = None
         self.view = view
         self.state = SpyGlass.State_BUSY
         self.sgTime = datetime.now()
         self.frametime = self.sgTime
-        self.lastUpdate = self.sgTime
-        self.event_start = self.sgTime
-        self.event_objects = set()
-        self.event_calls = 0
-        # List of object classes that trigger event capture
-        self.interesting_objects = cfg.get('interesting_objects', ['person'])
 
     def has_result(self) -> bool:
         if self._tasking.is_ready():
@@ -374,136 +216,12 @@ class SpyGlass:
     def apply_lens(self, lenstype, image, frametime) -> None:
         self._tasking.apply_lens(lenstype, image)
         self.sgTime = frametime
-        self.event_calls += 1
-
-    def new_target(self, item, classname, baseclass) -> Target:
-        self._targets[item] = Target(item, classname, baseclass)
-        return self._targets[item]
-
-    def get_target(self, item) -> Target:
-        return self._targets.get(item, None)
-
-    def update_target_geo(self, item, rect, cent, source, wen) -> None:
-        if item in self._targets:
-            self._targets[item].update_geo(rect, cent, source, wen)
-
-    def drop_target(self, item) -> None:
-        if item in self._targets:
-            del self._targets[item]
-
-    def get_count(self) -> int:
-        return len(self._targets)
-
-    def get_targets(self) -> list:
-        return list(self._targets.values())
 
     def detect_motion(self, image) -> tuple:
         return self._motion.detect(image)
-
-    def new_event(self) -> dict:
-        self.eventID = uuid.uuid1().hex
-        self.event_start = datetime.now()
-        self.event_objects = set()
-        self.event_calls = 0
-        self._logdata = {'id': self.eventID, 'view': self.view, 'type': 'start', 'new': True}
-        return self._logdata
-
-    def trackingLog(self, type) -> dict:
-        self._logdata = {'id': self.eventID, 'view': self.view, 'type': type}
-        return self._logdata
-
-    def event_elapsed(self) -> timedelta:
-        return datetime.now() - self.event_start
-
-    def event_count(self) -> int:
-        return self.event_calls
-
-    def target_summary(self) -> set:
-        return self.event_objects
 
     def terminate(self):
         self._tasking.terminate()
 
     def __del__(self) -> None:
         self.terminate()
-
-    def resetTargetList(self):
-        for target in self.get_targets():
-            self.drop_target(target.objectID)
-        trkdObjs = list(self._ct.objects.keys())
-        for o in trkdObjs:
-            self._ct.deregister(o)
-        self._dropList = {}
-
-    def reviseTargetList(self, lens, rects, labels) -> tuple:
-        # Centroid tracking algorithm courtesy of PyImageSearch.
-        # Using this to map tracked object centroids back to a
-        # dictionary of targets managed by the SpyGlass
-        centroids = self._ct.update(rects)
-
-        # TODO: Need to validate CentroidTracker initilization and overall
-        # fit within the context of the Outpost use cases. Specifically the
-        # max disappeared limit. The real gap in thinking is likely the assumption
-        # that an ocurrence number from the list of rects provides for a reliable
-        # mapping to objectID occurences coming out of the Centroid Tracker.
-        # Too many edge cases around this approach. Not a robust solution.
-        newTarget = False
-        interestingTargetFound = False
-        self.lastUpdate = datetime.now()
-
-        if self.CFG['tracker'] != "none":   # original tracking implementation has been deprecated
-
-            for i, (objectID, centroid) in enumerate(centroids.items()):
-
-                # Ignore anything on the drop list
-                if objectID in self._dropList:
-                    continue
-
-                # Grab the SpyGlass target via its object ID
-                target = self.get_target(objectID)
-
-                # Create new targets for tracking as needed.
-                if target is None:
-                    newTarget = True
-                    if labels and i<len(labels):
-                        classname = labels[i]
-                        baseclass = classname.split(':')[0]
-                    else:
-                        classname = baseclass = 'mystery'
-                    target = self.new_target(objectID, classname, baseclass)
-                    logging.debug(f"new_target({objectID}, {classname}, {baseclass})")
-
-                rect = rects[i] if i<len(rects) else (0,0,0,0)  # TODO: fix this stupid hack? (serves as a fail-safe)
-                target.update_geo(rect, centroid, lens, self.lastUpdate)
-                logging.debug(f"update_geo:{target.toJSON()}")
-        else:
-            self._targets = {}
-            for objid, (rect, classname) in enumerate(zip(rects, labels)):
-                newTarget = True
-                baseclass = classname.split(':')[0]
-                target = self.new_target(objid, classname, baseclass)
-                (x1,y1,x2,y2) = rect
-                cX = int((x1 + x2) / 2.0)
-                cY = int((y1 + y2) / 2.0)
-                target.update_geo(rect, (cX, cY), lens, self.lastUpdate)
-                if target.baseclass in self.interesting_objects:
-                    interestingTargetFound = True
-                logging.debug(f"update_geo:{target.toJSON()}")
-
-        self.event_objects.update({t.baseclass for t in self.get_targets()})
-
-        if self.CFG['tracker'] != "none":
-
-            for target in self.get_targets():
-
-                # Drop vanished objects from SpyGlass
-                if target.objectID not in self._ct.objects.keys():
-                    logging.debug(f"Target {target.objectID} vanished")
-                    self.drop_target(target.objectID)
-
-                # when does it get interesting?
-                elif target.baseclass in self.interesting_objects:
-                    interestingTargetFound = True
-
-        logging.debug(f"Target count {self.get_count()}, new={newTarget}, interested={interestingTargetFound}")
-        return (newTarget, interestingTargetFound)

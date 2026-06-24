@@ -8,11 +8,14 @@ this adapter consumes the results.
 
 Two entry points, mirroring the tracker's two clocks:
 
-  observe(ct, rects, labels)  the NN ran on the frame captured at `ct`. Decode the
-                              raw detections -> tracker.observe() -> event manager.
-                              An EMPTY result is a valid "saw nothing" observation
-                              (a present subject that left is correctly missed) — it
-                              is still an observe(), NOT a quiet frame.
+  observe(ct, detections)     the NN ran on the frame captured at `ct`. `detections`
+                              is the structured lens output — a list of
+                              (class_name, (x1,y1,x2,y2) px, confidence) tuples (§4.10
+                              detection contract, same shape the OAK device carries).
+                              Decode -> tracker.observe() -> event manager. An EMPTY
+                              list is a valid "saw nothing" observation (a present
+                              subject that left is correctly missed) — it is still an
+                              observe(), NOT a quiet frame.
   tick(ct)                    a motion-quiet frame: no NN inference ran. Advance the
                               tracker clock only — never observe([]), which would
                               falsely gap-out a standing subject (§4.10(ii)).
@@ -30,19 +33,6 @@ drop (the interesting-class filter, host_tracker §3).
 from __future__ import annotations
 
 from typing import Callable, Optional
-
-
-def _parse_label(label: Optional[str]) -> tuple:
-    """'car: 0.9600' -> ('car', 0.96). Missing/garbled confidence -> 1.0 (unknown ==
-    unfiltered, same convention as the tracker's admission floor)."""
-    if not label:
-        return (None, 1.0)
-    name, _, conf = str(label).partition(":")
-    name = name.strip()
-    try:
-        return (name, float(conf))
-    except (TypeError, ValueError):
-        return (name, 1.0)
 
 
 class PicameraIntake:
@@ -85,12 +75,13 @@ class PicameraIntake:
 
     # -- the two clocks --------------------------------------------------- #
 
-    def observe(self, capture_time: float, rects, labels) -> None:
+    def observe(self, capture_time: float, detections) -> None:
         """A SpyGlass DETECT result is in. `capture_time` is the CURRENT frame's
         capture-time (clock note in __init__): the result's geometry is from a
-        slightly earlier frame but applied now. Empty result == a valid miss."""
+        slightly earlier frame but applied now. Empty list == a valid miss.
+        `detections` is the structured lens output: (class_name, bbox_px, conf)."""
         ct = self._advance(capture_time)
-        dets = self._decode(rects, labels)
+        dets = self._decode(detections)
         self.dets_seen += len(dets)
         self.observes += 1
         transitions = self._tracker.observe(ct, dets)
@@ -105,21 +96,22 @@ class PicameraIntake:
 
     # -- helpers ---------------------------------------------------------- #
 
-    def _decode(self, rects, labels) -> list:
-        """Raw lens output -> tracker detections (baseclass, bbox, label, conf):
-        pixel boxes normalized to [0,1] against the detection frame; specific class
-        mapped to baseclass (None dropped at ingest); confidence parsed from the
-        label for the admission floor. 4-tuple matches HostTracker.observe()."""
+    def _decode(self, detections) -> list:
+        """Structured lens output -> tracker detections (baseclass, bbox, label, conf):
+        each input is (class_name, (x1,y1,x2,y2) px, confidence). Pixel boxes are
+        normalized to [0,1] against the detection frame; the specific class is mapped
+        to a baseclass (None dropped at ingest); the display label ("car: 0.9600") is
+        BUILT here from the structured fields. 4-tuple matches HostTracker.observe()
+        and converges with the OAK intake's decode shape (outpost_intake §decode)."""
         out = []
         W, H = self.cam_w, self.cam_h
-        labels = labels or []
-        for i, rect in enumerate(rects):
-            label = labels[i] if i < len(labels) else None
-            specific, conf = _parse_label(label)
-            base = self._classify(specific)
+        for det in detections:
+            name, bbox, conf = det[0], det[1], float(det[2])
+            base = self._classify(name)
             if base is None:                             # not interesting — drop at ingest
                 continue
-            x1, y1, x2, y2 = rect
-            bbox = (x1 / W, y1 / H, x2 / W, y2 / H)
-            out.append((base, bbox, label if label else base, conf))
+            x1, y1, x2, y2 = bbox
+            nbbox = (x1 / W, y1 / H, x2 / W, y2 / H)
+            label = f"{name}: {conf:.4f}"
+            out.append((base, nbbox, label, conf))
         return out
