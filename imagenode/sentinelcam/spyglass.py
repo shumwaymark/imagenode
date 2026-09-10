@@ -18,7 +18,7 @@ import numpy as np
 import multiprocessing
 from multiprocessing import sharedctypes
 from datetime import datetime
-from time import sleep
+from time import monotonic, sleep
 import imagezmq
 import msgpack
 import zmq
@@ -45,6 +45,12 @@ class LensWire:
     def recv(self) -> tuple:
         return msgpack.unpackb(self._recv(), use_list=False)
 
+    def close(self) -> None:
+        # Explicit, because a recycle must tear the wire down deterministically:
+        # the REP socket is left mid-transaction (a request was sent, the reply
+        # never came) and cannot be reused.
+        self._wire.close()
+
     def __del__(self) -> None:
         self._wire.close()
 
@@ -67,16 +73,51 @@ class LensTasking:
             return LensTasking.OBJECT_DETECTORS[detect](cfg[detect], accelerator=accelerator)
 
     def __init__(self, camsize, cfg) -> None:
-        dtype = np.dtype('uint8')
-        shape = (camsize[1], camsize[0], 3)
-        self._frameBuffer = sharedctypes.RawArray('c', shape[0]*shape[1]*shape[2])
+        self._dtype = np.dtype('uint8')
+        self._shape = (camsize[1], camsize[0], 3)
+        self._cfg = cfg
+        self._frameBuffer = sharedctypes.RawArray(
+            'c', self._shape[0]*self._shape[1]*self._shape[2])
         self._wire = LensWire(LensTasking.LENS_WIRE)
+        self._spawn()  # blocking handshake at startup, as it always was
+
+    def _spawn(self, handshake_timeout=None) -> bool:
+        """Fork the child and complete the priming handshake.
+
+        The child publishes its handshake BEFORE loading the lens, so this returns
+        promptly even when the model load behind it is slow. `handshake_timeout`
+        bounds the wait for a recycle -- blocking the imagenode main loop on a
+        child that may never come up would turn a detection outage into a total
+        outpost stall, which is strictly worse than the fault being recovered.
+        """
         self.process = multiprocessing.Process(target=self._taskLoop, args=(
-            self._frameBuffer, dtype, shape, cfg))
+            self._frameBuffer, self._dtype, self._shape, self._cfg))
         self.process.start()
+        if handshake_timeout is not None:
+            deadline = monotonic() + handshake_timeout
+            while not self._wire.ready():
+                if monotonic() > deadline:
+                    return False
+                sleep(0.05)
         handshake = self._wire.recv()  # wait on handshake from subprocess
-        self._sharedFrame = np.frombuffer(self._frameBuffer, dtype=dtype).reshape(shape)
+        self._sharedFrame = np.frombuffer(
+            self._frameBuffer, dtype=self._dtype).reshape(self._shape)
         self._wire.send(handshake)  # send it right back to prime the pump
+        return True
+
+    def recycle(self, handshake_timeout=10.0) -> bool:
+        """Kill a wedged child and stand up a fresh one. Returns True on success.
+
+        The only recovery available when the accelerator stops answering. Its
+        blocking call sits in C holding the device fd, so nothing in-process can
+        interrupt it -- killing the child is what releases the device, and the
+        driver resets it on the next open. The shared frame buffer is plain memory
+        and is reused; the wire is not, and must be rebuilt.
+        """
+        self.terminate()
+        self._wire.close()
+        self._wire = LensWire(LensTasking.LENS_WIRE)
+        return self._spawn(handshake_timeout)
 
     def _taskLoop(self, framebuff, dtype, shape, cfg):
         outpost = None
@@ -144,8 +185,8 @@ class LensTasking:
 
     def terminate(self) -> None:
         if self.process.is_alive():
-            self.process.kill()
-            self.process.join()
+            self.process.kill()   # SIGKILL: a child blocked in a C call cannot
+            self.process.join()   # service SIGTERM, so there is nothing gentler
 
 class SpyGlass:
     """ A DETECT-only inference engine for the SentinelCam Outpost.
@@ -195,6 +236,11 @@ class SpyGlass:
         self.state = SpyGlass.State_BUSY
         self.sgTime = datetime.now()
         self.frametime = self.sgTime
+        # Watchdog bookkeeping. _sent_at is monotonic on purpose: sgTime carries
+        # the image CAPTURE time (anti-pattern #5) and is the wrong clock for
+        # measuring how long a request has been outstanding.
+        self._sent_at = monotonic()
+        self._pending = True          # __init__'s handshake echo primes a request
 
     def has_result(self) -> bool:
         if self._tasking.is_ready():
@@ -208,6 +254,7 @@ class SpyGlass:
 
     def get_data(self) -> tuple:
         self.frametime = self.sgTime
+        self._pending = False
         return self._tasking.get_result()
 
     def get_frametime(self) -> datetime:
@@ -216,6 +263,39 @@ class SpyGlass:
     def apply_lens(self, lenstype, image, frametime) -> None:
         self._tasking.apply_lens(lenstype, image)
         self.sgTime = frametime
+        self._sent_at = monotonic()
+        self._pending = True
+
+    def is_wedged(self, deadline) -> bool:
+        """True when a request has gone unanswered past `deadline` seconds.
+
+        Distinguishing a wedged child from an idle one is the whole trick. A
+        healthy result may sit on the wire unconsumed for a long time -- while the
+        scene is quiet the outpost never calls has_result(), and the pairing is
+        deliberately left intact. So a bare 'time since apply_lens' would fire on
+        a perfectly healthy idle camera. The discriminator is the wire itself: an
+        answered request always shows POLLIN, whatever the caller does about it.
+        Nothing on the wire, for this long, means the child never answered.
+
+        The failure this catches leaves no trace anywhere else -- the accelerator
+        stops responding with no USB reset, no kernel error, and no exception for
+        the child to raise. There is nothing to catch; there is only a reply that
+        never comes.
+        """
+        if not deadline or not self._pending:
+            return False
+        if self._tasking.is_ready():
+            return False              # answered; merely not collected yet
+        return (monotonic() - self._sent_at) > deadline
+
+    def recycle(self) -> bool:
+        """Replace a wedged child process. Returns True on success."""
+        ok = self._tasking.recycle()
+        # The fresh child's handshake echo primes a request, exactly as at startup.
+        self._sent_at = monotonic()
+        self._pending = ok
+        self.state = SpyGlass.State_BUSY
+        return ok
 
     def detect_motion(self, image) -> tuple:
         return self._motion.detect(image)

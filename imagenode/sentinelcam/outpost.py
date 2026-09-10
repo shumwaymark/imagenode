@@ -68,6 +68,7 @@ class Outpost:
         self.sg = SpyGlass(viewname, self.dimensions, self.cfg)
         self._heartbeat = (0,0)
         self._looks = 0
+        self._sg_wedges = 0
         self._tick = 0
         self._evts = 0
         if self.depthAI:
@@ -182,6 +183,23 @@ class Outpost:
         tick(). Exactly one SpyGlass request is in flight (REQ/REP): every recv
         (get_data) is paired with a send (apply_lens). While quiet and idle the
         pending result lingers unconsumed — pairing intact — until motion resumes."""
+        # Watchdog first: a wedged SpyGlass answers nothing ever again, and the
+        # motion gate below would simply stop calling it. The outpost stays fully
+        # healthy on every other axis -- scene publishing, heartbeat, frame rate --
+        # while detection is silently dead, which is exactly why this needs its own
+        # check rather than riding on any existing one.
+        if self.sg.is_wedged(self.spyglass_timeout):
+            self._sg_wedges += 1
+            logging.critical(
+                f"SpyGlass has not answered in {self.spyglass_timeout}s "
+                f"(recycle #{self._sg_wedges}) — inference child presumed wedged, "
+                f"replacing it. Detection was stalled; the scene plane was not.")
+            if self.sg.recycle():
+                logging.info("SpyGlass recycled; detection resuming")
+            else:
+                logging.critical(
+                    "SpyGlass recycle FAILED — no inference child. Scene publishing "
+                    "continues; detection stays down until the next attempt.")
         ct = self._rate.lastStamp().timestamp()
         active = self._picam_events.event_open or self._picam_tracker.has_active()
         consumed = False
@@ -211,6 +229,11 @@ class Outpost:
             self.publish_cam = config['publish_cam']
         else:
             self.publish_cam = False
+        # Seconds an unanswered SpyGlass request may stand before the inference
+        # child is presumed wedged and replaced. Must clear a cold start: the child
+        # loads its model and sleeps 3s before it can answer the primed request.
+        # 0 disables the watchdog.
+        self.spyglass_timeout = config.get('spyglass_timeout', 30)
         if 'spyglass' in config:
             self.dimensions = literal_eval(config['spyglass'])
         else:
