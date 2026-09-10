@@ -185,12 +185,16 @@ class ScenePublisher(threading.Thread):
         self._q = q_jpeg
         self._publish = publish
         self._idle = idle_sleep
-        self._stop = threading.Event()
+        # NOT `_stop`: threading.Thread._stop is an internal method that
+        # _wait_for_tstate_lock() calls from both join() and is_alive(). Shadowing
+        # it with an Event makes every join()/is_alive() on a finished thread raise
+        # TypeError: 'Event' object is not callable.
+        self._halt = threading.Event()
         self.published = 0
 
     def run(self) -> None:
         last_err_log = 0.0
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 msg = self._q.tryGet()
                 if msg is None:
@@ -201,7 +205,15 @@ class ScenePublisher(threading.Thread):
                 dev_s = msg.getTimestamp().total_seconds()
                 self._publish(msg.getSequenceNum(), dev_s, bytes(msg.getData()))
                 self.published += 1
-            except Exception:
+            except Exception as ex:
+                # Belt and braces for a lost shutdown race -- SIGKILL, or a frame
+                # in flight when OAKcamera.stop()'s join times out. pyzmq's garbage
+                # collector refuses a socket during interpreter teardown; the
+                # process is going away regardless, so retire quietly rather than
+                # leave an ERROR traceback that would mask a real publisher fault.
+                if isinstance(ex, RuntimeError) and "during shutdown" in str(ex):
+                    self._halt.set()
+                    return
                 now = time.monotonic()           # never die silently (see OutpostIntake.run)
                 if now - last_err_log >= 30.0:
                     logging.exception("ScenePublisher error")
@@ -209,7 +221,7 @@ class ScenePublisher(threading.Thread):
                 time.sleep(0.05)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._halt.set()
 
 
 # --------------------------------------------------------------------------- #
@@ -259,7 +271,7 @@ class OutpostIntake(threading.Thread):
         self._decode_meta = decode_meta
         self._pairer = CropPairer(mode=pair_mode)
         self._idle = idle_sleep
-        self._stop = threading.Event()
+        self._halt = threading.Event()   # not `_stop` — see ScenePublisher.__init__
         # keepalive telemetry — surfaced to the imagenode detector callback (§4.1)
         self.dets_seen = 0
         self.crops_paired = 0
@@ -268,7 +280,7 @@ class OutpostIntake(threading.Thread):
 
     def run(self) -> None:
         last_err_log = 0.0
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 did_work = self._drain_once()
             except Exception:
@@ -365,7 +377,7 @@ class OutpostIntake(threading.Thread):
         }
 
     def stop(self) -> None:
-        self._stop.set()
+        self._halt.set()
         self._pairer.flush_orphans()
 
 

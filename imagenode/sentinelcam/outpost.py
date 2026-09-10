@@ -38,6 +38,12 @@ class Outpost:
     # non-Optional (with an ignored None seed) so member access doesn't trip the
     # type checker on this initialize-once pattern.
     publisher: "imagezmq.ImageSender" = None  # type: ignore[assignment]  # image publishing over imageZMQ
+    # OAK event-plane teardown registry, keyed by viewname. setup_OAK registers;
+    # OAKcamera.stop() drains it. The registry exists because the imagenode
+    # framework builds the OAKcamera shim in Camera.__init__ AFTER setup_detectors
+    # has already constructed this Outpost and run setup_OAK -- so setup_OAK
+    # cannot hand the threads to the shim directly. The viewname is the join.
+    _oak_planes: dict = {}
 
     def __init__(self, detector, config, nodename, viewname):
         self.nodename = nodename
@@ -316,6 +322,10 @@ class Outpost:
         self._oak_scene = scene
         self._oak_t0 = time.monotonic()
         self._oak_last_hb = 0.0
+        # Register for shutdown. imagenode's closeall() calls camera.cam.stop()
+        # on every camera before tearing down its own sender; OAKcamera.stop()
+        # drains this in order -- threads, device, sockets.
+        Outpost._oak_planes[self.viewname] = (scene, intake, self._oak, self._crop_pub)
         logging.info(
             f"OAK event plane started: view={self.viewname} "
             f"scene=:{self.publish_cam} crops=:{config['crop_publish']}")
@@ -387,6 +397,7 @@ class OAKcamera:
     """
 
     _PACE_S = 0.05                       # ~20 Hz housekeeping; real 30 fps work is on the threads
+    _JOIN_S = 2.0                        # per-thread shutdown join; both stop on a threading.Event
     _PLACEHOLDER = np.zeros((4, 4, 3), dtype=np.uint8)
 
     def __init__(self, view) -> None:
@@ -397,5 +408,59 @@ class OAKcamera:
         return OAKcamera._PLACEHOLDER
     def getImgFrame(self) -> object:
         return self.frame
+
     def stop(self) -> None:
-        pass
+        """Tear down this view's OAK event plane.
+
+        Reached from imagenode's ``closeall()``, which calls ``camera.cam.stop()``
+        for every camera BEFORE closing its own sender. Until this was wired the
+        threads outlived the main thread and pyzmq refused them a socket during
+        interpreter teardown -- an ERROR traceback on every restart, exactly the
+        noise that would hide a real publisher fault.
+
+        Order matters: stop and join the threads first so nothing is mid-``send``,
+        then stop the device pipeline, then close the sockets those threads were
+        publishing to. Reversed, one shutdown traceback is merely traded for
+        another.
+        """
+        plane = Outpost._oak_planes.pop(self.view, None)
+        if plane is None:
+            return                       # never started, or already torn down
+        scene, intake, oak, crop_pub = plane
+
+        for thread in (scene, intake):   # cooperative: both loop on a threading.Event
+            try:
+                thread.stop()
+                thread.join(timeout=self._JOIN_S)
+                if thread.is_alive():
+                    logging.warning(
+                        f"OAK {thread.name} still running after {self._JOIN_S}s join")
+            except Exception:
+                logging.exception(f"OAK {thread.name} shutdown error")
+
+        try:
+            oak.close()                  # stops the device pipeline
+        except Exception:
+            logging.exception("OAK device shutdown error")
+
+        _close(crop_pub, "crop")
+        # The scene publisher is a process-wide singleton shared by every view --
+        # close it only once the last OAK plane is down, or a second view's
+        # still-running ScenePublisher would find the socket gone.
+        if not Outpost._oak_planes:
+            _close(Outpost.publisher, "scene")
+            Outpost.publisher = None     # type: ignore[assignment]
+
+        logging.info(f"OAK event plane stopped: view={self.view}")
+
+
+def _close(sender, label: str) -> None:
+    """Close an imagezmq sender the way imagenode closes its own (LINGER 0 first,
+    which is what prevents a ZMQ hang on exit)."""
+    if sender is None:
+        return
+    try:
+        sender.zmq_socket.setsockopt(zmq.LINGER, 0)
+        sender.close()
+    except Exception:
+        logging.exception(f"OAK {label} publisher close error")
