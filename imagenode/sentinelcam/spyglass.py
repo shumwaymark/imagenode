@@ -12,6 +12,7 @@ Copyright (c) 2021 by Mark K Shumway, mark.shumway@swanriver.dev
 License: MIT, see the SentinelCam LICENSE for more details.
 """
 
+import atexit
 import traceback
 import cv2
 import numpy as np
@@ -80,6 +81,28 @@ class LensTasking:
             'c', self._shape[0]*self._shape[1]*self._shape[2])
         self._wire = LensWire(LensTasking.LENS_WIRE)
         self._spawn()  # blocking handshake at startup, as it always was
+        # multiprocessing joins EVERY non-daemon child at interpreter exit --
+        # unbounded, and with no SIGTERM of its own (only daemon children get
+        # that, and a child blocked in a C call could not service it anyway). So
+        # a wedged child hangs the whole shutdown until the service manager's
+        # stop timeout expires and SIGKILLs the group: measured at 91s of dead
+        # air on a wedged node, all of it after the last log line, which is why
+        # it never showed up as anything but "the restart takes a while".
+        # atexit runs LIFO and multiprocessing registers its handler at import
+        # time, so this one -- registered later -- runs FIRST and kills the child
+        # before that join is ever attempted.
+        atexit.register(self._reap)
+
+    def _reap(self) -> None:
+        """atexit hook: make sure no child outlives the interpreter.
+
+        Idempotent -- terminate() no-ops on a child that has already gone -- so an
+        orderly shutdown that called it costs nothing here.
+        """
+        try:
+            self.terminate()
+        except Exception:
+            pass    # interpreter teardown; never raise out of an atexit handler
 
     def _spawn(self, handshake_timeout=None) -> bool:
         """Fork the child and complete the priming handshake.
