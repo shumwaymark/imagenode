@@ -10,7 +10,6 @@ import logging
 import logging.config
 import json
 import socket
-import threading
 import time
 import zmq
 import imagezmq
@@ -270,6 +269,7 @@ class Outpost:
         from sentinelcam.eventmanager import EventManager
         from sentinelcam.eventsampler import EventSampler, LateralTraversalStrategy
         from sentinelcam.outpost_intake import OutpostIntake, ScenePublisher, CropLookback
+        from sentinelcam.wallclock import WallClock
 
         oak_cfg = config.get("oak_pipeline", {})
         self._crop_quality = int(oak_cfg.get("jpeg_quality", 90))
@@ -277,14 +277,14 @@ class Outpost:
         # Keep in sync with that requestOutput; trk rects denormalize against it.
         scene_size = (768, 432)
 
-        # Shared device->wall clock state. The scene publisher (Plane 1) and the
+        # Shared capture-time->wall clock. The scene publisher (Plane 1) and the
         # event manager / sampler (Plane 2) BOTH stamp records via _oak_clock(ct)
         # off the SAME per-frame device capture-time, so image[N] and trk/crp[N]
         # carry an identical timestamp string (exact-match correlation downstream:
         # camwatcher image naming, VehicleSpeed timestamp_to_offset, overlays).
-        self._oak_t0_wall = None
-        self._oak_t0_dev = None
-        self._oak_clock_lock = threading.Lock()
+        # It follows a wall-clock step (NTP correcting a stale no-RTC boot clock)
+        # by rebasing between events — see wallclock.py.
+        self._oak_wallclock = WallClock()
 
         # Phase-2 device pipeline: one NN Archive, four host output queues.
         self._oak = OakCamera(config["nn_archive"], oak_cfg)
@@ -335,6 +335,11 @@ class Outpost:
             decode_meta=CropMeta.unpack,
             # specific MobileNet-SSD label name for the trk record (car/bus/train/…)
             label_name=lambda i: MOBILENET_LABELS[i] if 0 <= i < len(MOBILENET_LABELS) else str(i),
+            # idle = no event open, and every subject banked QUIESCENT: nothing
+            # PROVISIONAL whose entry crops could straddle a rebase.
+            on_observe=lambda ct: self._oak_wallclock.observe(
+                ct, idle=not events.event_open
+                and len(tracker.scene_state()) == len(tracker.tracks)),
         )
 
         scene.start()
@@ -357,28 +362,19 @@ class Outpost:
         """ISO timestamp for OAK OTE/scene records.
 
         Maps the device capture-time (`dev_seconds` = ImgFrame.getTimestamp()
-        .total_seconds(), a monotonic device epoch) to wall-clock, anchoring the
-        offset ONCE on the first frame seen (anti-pattern #5: capture-time, not
-        per-call now()). Scene, trk, and crp all route through here off the same
-        per-frame `dev_seconds`, so the same camera frame yields an IDENTICAL
-        timestamp string across streams — required for exact-match correlation
-        (camwatcher image naming, VehicleSpeed timestamp_to_offset, overlays).
+        .total_seconds(), host-monotonic via DepthAI's clock sync) to wall-clock
+        (anti-pattern #5: capture-time, not per-call now()). Scene, trk, and crp
+        all route through here off the same per-frame `dev_seconds`, so the same
+        camera frame yields an IDENTICAL timestamp string across streams —
+        required for exact-match correlation (camwatcher image naming,
+        VehicleSpeed timestamp_to_offset, overlays).
 
         Note: relies on the scene and detection requestOutputs carrying the same
         device timestamp for a given source frame (same capture, propagated
-        seqnum). If hardware ever shows them diverging, switch the anchor key to
-        the seqnum (guaranteed identical across streams).
+        seqnum). If hardware ever shows them diverging, switch the key to the
+        seqnum (guaranteed identical across streams).
         """
-        if self._oak_t0_wall is None:
-            with self._oak_clock_lock:
-                if self._oak_t0_wall is None:
-                    self._oak_t0_wall = time.time()
-                    self._oak_t0_dev = dev_seconds
-        # both anchored together above; capture to locals so the invariant is
-        # explicit (the double-checked lock defeats the type-narrowing on the attrs)
-        t0_wall, t0_dev = self._oak_t0_wall, self._oak_t0_dev
-        assert t0_wall is not None and t0_dev is not None
-        return datetime.fromtimestamp(t0_wall + (dev_seconds - t0_dev)).isoformat()
+        return self._oak_wallclock.stamp(dev_seconds)
 
     def _encode_crop(self, frame) -> bytes:
         """NV12 device crop -> JPEG. DepthAI v3 cannot hardware-encode dynamic

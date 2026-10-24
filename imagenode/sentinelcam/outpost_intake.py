@@ -258,6 +258,9 @@ class OutpostIntake(threading.Thread):
         # defense-in-depth upgrade and additionally needs the device Script to
         # stamp seqnum*STRIDE+det_idx onto each crop (§3.2, never-observed edge).
         pair_mode: PairMode = PairMode.SEQNUM,
+        # called with each det capture-time BEFORE the tracker sees it — the
+        # wall-clock step check, which must run on the thread that owns events.
+        on_observe: Optional[Callable[[float], None]] = None,
         idle_sleep: float = 0.002,
     ) -> None:
         super().__init__(name="OutpostIntake", daemon=True)
@@ -270,6 +273,7 @@ class OutpostIntake(threading.Thread):
         self._label_name = label_name
         self._decode_meta = decode_meta
         self._pairer = CropPairer(mode=pair_mode)
+        self._on_observe = on_observe
         self._idle = idle_sleep
         self._halt = threading.Event()   # not `_stop` — see ScenePublisher.__init__
         # keepalive telemetry — surfaced to the imagenode detector callback (§4.1)
@@ -310,6 +314,8 @@ class OutpostIntake(threading.Thread):
             worked = True
             self.dets_seen += 1
             ct = _capture_time(d)
+            if self._on_observe is not None:
+                self._on_observe(ct)
             dets = self._decode_detections(d)
             transitions = self._tracker.observe(ct, dets)
             # called every observe: emits trk for ACTIVE tracks + opens/closes events
